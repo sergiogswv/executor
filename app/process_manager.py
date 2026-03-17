@@ -1,0 +1,173 @@
+import asyncio
+import logging
+import os
+import uuid
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+from app.models import ServiceDefinition, TerminalInfo
+
+logger = logging.getLogger("ejecutor.process_manager")
+
+# Directorio donde se guardan los logs de cada terminal
+LOGS_DIR = Path("logs")
+LOGS_DIR.mkdir(exist_ok=True)
+
+
+class ProcessManager:
+    """
+    Gestiona los procesos (terminales) abiertos por el Ejecutor.
+    Cada proceso tiene un terminal_id único y se puede cerrar individualmente.
+    """
+
+    def __init__(self):
+        # terminal_id → (process, TerminalInfo, log_files)
+        self._terminals: dict[str, tuple[asyncio.subprocess.Process, TerminalInfo, list]] = {}
+
+    async def open(self, service_key: str, service: ServiceDefinition) -> TerminalInfo:
+        """
+        Abre una nueva terminal ejecutando el comando del servicio.
+        stdout/stderr se redirigen a archivos de log para evitar bloqueos.
+        """
+        terminal_id = f"{service_key}-{uuid.uuid4().hex[:8]}"
+
+        # Construir environment
+        env = os.environ.copy()
+        env.update(service.env)
+
+        # Archivos de log para este terminal
+        log_stdout = open(LOGS_DIR / f"{terminal_id}.stdout.log", "w")
+        log_stderr = open(LOGS_DIR / f"{terminal_id}.stderr.log", "w")
+
+        import subprocess
+
+        # Construir y ejecutar el comando usando subprocess tradicional
+        # subprocess.Popen no bloquea, por lo que es seguro llamarlo en el thread principal
+        if service.shell:
+            proc = subprocess.Popen(
+                service.command,
+                cwd=service.cwd,
+                env=env,
+                stdout=log_stdout,
+                stderr=log_stderr,
+                shell=True
+            )
+        else:
+            args = service.command.split()
+            proc = subprocess.Popen(
+                args,
+                cwd=service.cwd,
+                env=env,
+                stdout=log_stdout,
+                stderr=log_stderr,
+            )
+
+        info = TerminalInfo(
+            terminal_id=terminal_id,
+            service=service_key,
+            service_name=service.name,
+            pid=proc.pid,
+            command=service.command,
+            cwd=service.cwd,
+            status="running",
+            started_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+        self._terminals[terminal_id] = (proc, info, [log_stdout, log_stderr])
+
+        logger.info(
+            f"🟢 [{service_key}] Levantado | terminal_id={terminal_id} "
+            f"pid={proc.pid} cwd={service.cwd}"
+        )
+
+        # Monitoreo en background
+        asyncio.create_task(self._monitor(terminal_id))
+
+        return info
+
+    async def close(self, terminal_id: str) -> bool:
+        """
+        Termina un proceso por su terminal_id.
+        Retorna True si se cerró, False si no existía.
+        """
+        entry = self._terminals.get(terminal_id)
+        if not entry:
+            logger.warning(f"⚠️  Terminal {terminal_id} no encontrada")
+            return False
+
+        proc, info, log_files = entry
+        import platform
+        import subprocess
+        
+        if platform.system() == "Windows":
+            # Matar el árbol de procesos en Windows (necesario si se usó shell=True)
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+        
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+        # Cerrar archivos de log
+        for f in log_files:
+            try:
+                f.close()
+            except Exception:
+                pass
+
+        info.status = "stopped"
+        if terminal_id in self._terminals:
+            del self._terminals[terminal_id]
+            
+        logger.info(f"🔴 [{info.service}] Detenido | terminal_id={terminal_id}")
+        return True
+
+    async def kill_all(self) -> list[str]:
+        """Termina todos los procesos activos. Retorna lista de terminal_ids cerrados."""
+        ids = list(self._terminals.keys())
+        for tid in ids:
+            await self.close(tid)
+        logger.info(f"💥 kill-all — {len(ids)} terminales cerradas")
+        return ids
+
+    def status(self, terminal_id: str) -> TerminalInfo | None:
+        """Retorna el estado de una terminal específica."""
+        entry = self._terminals.get(terminal_id)
+        return entry[1] if entry else None
+
+    def list_all(self) -> list[TerminalInfo]:
+        """Retorna todas las terminales activas."""
+        return [info for _, info, _ in self._terminals.values()]
+
+    def find_by_service(self, service_key: str) -> list[TerminalInfo]:
+        """Retorna todas las terminales de un servicio específico."""
+        return [
+            info for _, info, _ in self._terminals.values()
+            if info.service == service_key
+        ]
+
+    async def _monitor(self, terminal_id: str) -> None:
+        """Monitorea en background si el proceso termina inesperadamente."""
+        entry = self._terminals.get(terminal_id)
+        if not entry:
+            return
+
+        proc, info, log_files = entry
+        try:
+            await asyncio.to_thread(proc.wait)
+        except Exception as e:
+            logger.error(f"Error esperando proc.wait(): {e}")
+
+        if terminal_id in self._terminals:
+            # Cerrar log files
+            for f in log_files:
+                f.close()
+            info.status = "stopped"
+            del self._terminals[terminal_id]
+            if proc.returncode != 0:
+                logger.warning(
+                    f"⚠️  [{info.service}] Proceso terminó con exit code {proc.returncode} "
+                    f"| terminal_id={terminal_id}"
+                )
+            else:
+                logger.info(f"✅ [{info.service}] Proceso terminó OK | terminal_id={terminal_id}")

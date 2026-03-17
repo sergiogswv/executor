@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+logs/
+.DS_Store
+
+# Sentinel - Archivos de configuración y caché (contienen API keys)
+.sentinelrc.toml
+.sentinel_stats.json
+.sentinel/

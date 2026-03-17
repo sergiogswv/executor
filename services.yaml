@@ -1,0 +1,67 @@
+# ─── Ejecutor — Configuración de Servicios ───────────────────────────────────
+#
+# Cada entrada define un "servicio" que el Ejecutor sabe levantar.
+# El Cerebro solo necesita mandar el nombre del servicio (ej: "warden").
+# El Ejecutor busca aquí el comando, directorio y variables de entorno.
+#
+# Campos:
+#   name:     Nombre legible del servicio
+#   command:  Comando a ejecutar (string o lista de args)
+#   cwd:      Directorio de trabajo (absoluto o relativo al ejecutor)
+#   env:      Variables de entorno adicionales (opcional)
+#   port:     Puerto del servicio (solo informativo, para health checks futuros)
+#   shell:    Si ejecutar dentro de un shell (default: false)
+
+services:
+
+  cerebro:
+    name: "Cerebro — Orquestador"
+    command: ".venv\\Scripts\\python.exe main.py"
+    cwd: "C:/Users/Sergio/Documents/dev/cerebro"
+    port: 4000
+    shell: true
+    env:
+      ORCHESTRATOR_MODE: "rest"
+      LOG_LEVEL: "INFO"
+
+  warden:
+    name: "Warden — Agente de Seguridad"
+    command: "C:/Users/Sergio/Documents/dev/warden/target/debug/warden.exe serve"
+    cwd: "C:/Users/Sergio/Documents/dev/warden"
+    port: 4003
+    shell: true
+    env:
+      CEREBRO_URL: "http://127.0.0.1:4000"
+      WARDEN_PORT: "4003"
+      CEREBRO_REPORT_ENABLED: "true"
+
+  sentinel:
+    name: "Sentinel — Agente de Monitoreo"
+    command: "C:/Users/Sergio/Documents/dev/sentinel-pro/target/debug/sentinel.exe serve"
+    cwd: "C:/Users/Sergio/Documents/dev/sentinel-pro"
+    port: 4001
+    shell: true
+    env:
+      CEREBRO_URL: "http://127.0.0.1:4000"
+      SENTINEL_PORT: "4001"
+      CEREBRO_REPORT_ENABLED: "true"
+
+  architect:
+    name: "Architect Linter — Agente de Calidad"
+    command: "C:/Users/Sergio/Documents/dev/architect-linter-pro/target/debug/architect-linter-pro.exe serve"
+    cwd: "C:/Users/Sergio/Documents/dev/architect-linter-pro"
+    port: 4002
+    shell: true
+    env:
+      CEREBRO_URL: "http://127.0.0.1:4000"
+      ARCHITECT_PORT: "4002"
+
+  notifier:
+    name: "Notificador — Agente Telegram"
+    command: ".venv\\Scripts\\python.exe main.py"
+    cwd: "C:/Users/Sergio/Documents/dev/google-ollama-telegram-agent"
+    port: 4100
+    shell: true
+    env:
+      CEREBRO_URL: "http://127.0.0.1:4000"
+      PORT: "4100"
