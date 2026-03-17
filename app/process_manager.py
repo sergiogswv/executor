@@ -24,11 +24,30 @@ class ProcessManager:
         # terminal_id → (process, TerminalInfo, log_files)
         self._terminals: dict[str, tuple[asyncio.subprocess.Process, TerminalInfo, list]] = {}
 
+    def _is_port_in_use(self, port: int) -> bool:
+        """Verifica si un puerto TCP está ocupado en localhost."""
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            # connect_ex retorna 0 si la conexión fue exitosa (puerto ocupado)
+            return s.connect_ex(('127.0.0.1', port)) == 0
+
     async def open(self, service_key: str, service: ServiceDefinition) -> TerminalInfo:
         """
         Abre una nueva terminal ejecutando el comando del servicio.
         stdout/stderr se redirigen a archivos de log para evitar bloqueos.
+        Verifica si el puerto está libre antes de iniciar.
         """
+        # VALIDACIÓN DE PUERTO (Skrymir se asegura de que esté libre)
+        if service.port and self._is_port_in_use(service.port):
+            logger.warning(f"⚠️  Puerto {service.port} para '{service_key}' ya está en uso.")
+            import platform
+            import subprocess
+            if platform.system() == "Linux":
+                logger.info(f"🎯 Intentando forzar liberación del puerto {service.port}...")
+                subprocess.run(["fuser", "-k", f"{service.port}/tcp"], capture_output=True)
+                await asyncio.sleep(1.0) # Esperar a que el SO libere el puerto
+
         terminal_id = f"{service_key}-{uuid.uuid4().hex[:8]}"
 
         # Construir environment
@@ -67,6 +86,7 @@ class ProcessManager:
             service=service_key,
             service_name=service.name,
             pid=proc.pid,
+            port=service.port,
             command=service.command,
             cwd=service.cwd,
             status="running",
@@ -133,7 +153,7 @@ class ProcessManager:
 
     async def close(self, terminal_id: str) -> bool:
         """
-        Termina un proceso por su terminal_id.
+        Termina un proceso por su terminal_id de forma garantizada.
         Retorna True si se cerró, False si no existía.
         """
         entry = self._terminals.get(terminal_id)
@@ -145,14 +165,29 @@ class ProcessManager:
         import platform
         import subprocess
         
+        logger.info(f"⏳ Cerrando {info.service} (PID {proc.pid})...")
+
         if platform.system() == "Windows":
             # Matar el árbol de procesos en Windows (necesario si se usó shell=True)
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
-        
-        try:
-            proc.kill()
-        except Exception:
-            pass
+        else:
+            # Linux: Matar hijos primero para evitar procesos "zombie" o colgados
+            try:
+                subprocess.run(["pkill", "-9", "-P", str(proc.pid)], capture_output=True)
+            except Exception:
+                pass
+            
+            try:
+                proc.terminate() # Intento amable
+                # Dar tiempo a que termine
+                for _ in range(10):
+                    if proc.poll() is not None: break
+                    await asyncio.sleep(0.1)
+                
+                if proc.poll() is None:
+                    proc.kill() # Forzado
+            except Exception:
+                pass
 
         # Cerrar archivos de log
         for f in log_files:
@@ -166,6 +201,13 @@ class ProcessManager:
             del self._terminals[terminal_id]
             
         logger.info(f"🔴 [{info.service}] Detenido | terminal_id={terminal_id}")
+
+        # VALIDACIÓN DE LIBERACIÓN DE PUERTO
+        if info.port and self._is_port_in_use(info.port):
+            logger.warning(f"⚠️  [{info.service}] El puerto {info.port} sigue ocupado tras el cierre.")
+        elif info.port:
+            logger.info(f"✅ [{info.service}] Puerto {info.port} liberado correctamente.")
+            
         return True
 
     async def kill_all(self) -> list[str]:

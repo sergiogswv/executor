@@ -37,9 +37,9 @@ async def lifespan(app: FastAPI):
         logger.info("🧠 Auto-iniciando Cerebro...")
         try:
             from app.models import ExecutorCommand
-            cmd = ExecutorCommand(action="open", service="cerebro", request_id="boot-cerebro")
             svc_def = registry.get("cerebro")
-            await manager.start(svc_def, cmd.request_id, env_overrides=svc_def.env)
+            if svc_def:
+                await manager.open("cerebro", svc_def)
         except Exception as e:
             logger.error("❌ No se pudo auto-iniciar Cerebro: %s", e)
 

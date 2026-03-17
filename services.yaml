@@ -1,4 +1,4 @@
-# ─── Ejecutor — Configuración de Servicios ───────────────────────────────────
+# ─── Ejecutor — Configuración de Servicios (LINUX) ──────────────────────────────
 #
 # Cada entrada define un "servicio" que el Ejecutor sabe levantar.
 # El Cerebro solo necesita mandar el nombre del servicio (ej: "warden").
@@ -16,8 +16,8 @@ services:
 
   cerebro:
     name: "Cerebro — Orquestador"
-    command: ".venv\\Scripts\\python.exe main.py"
-    cwd: "C:/Users/Sergio/Documents/dev/cerebro"
+    command: "./venv/bin/python3 -m uvicorn app.main:app --host 0.0.0.0 --port 4000"
+    cwd: "/home/protec/skrymir-suite/cerebro"
     port: 4000
     shell: true
     env:
@@ -26,8 +26,8 @@ services:
 
   warden:
     name: "Warden — Agente de Seguridad"
-    command: "C:/Users/Sergio/Documents/dev/warden/target/debug/warden.exe serve"
-    cwd: "C:/Users/Sergio/Documents/dev/warden"
+    command: "./target/release/warden serve"
+    cwd: "/home/protec/skrymir-suite/warden"
     port: 4003
     shell: true
     env:
@@ -37,8 +37,8 @@ services:
 
   sentinel:
     name: "Sentinel — Agente de Monitoreo"
-    command: "C:/Users/Sergio/Documents/dev/sentinel-pro/target/debug/sentinel.exe serve"
-    cwd: "C:/Users/Sergio/Documents/dev/sentinel-pro"
+    command: "./target/release/sentinel serve"
+    cwd: "/home/protec/skrymir-suite/sentinel"
     port: 4001
     shell: true
     env:
@@ -48,20 +48,10 @@ services:
 
   architect:
     name: "Architect Linter — Agente de Calidad"
-    command: "C:/Users/Sergio/Documents/dev/architect-linter-pro/target/debug/architect-linter-pro.exe serve"
-    cwd: "C:/Users/Sergio/Documents/dev/architect-linter-pro"
+    command: "./target/release/architect-linter-pro serve"
+    cwd: "/home/protec/skrymir-suite/architect"
     port: 4002
     shell: true
     env:
       CEREBRO_URL: "http://127.0.0.1:4000"
       ARCHITECT_PORT: "4002"
-
-  notifier:
-    name: "Notificador — Agente Telegram"
-    command: ".venv\\Scripts\\python.exe main.py"
-    cwd: "C:/Users/Sergio/Documents/dev/google-ollama-telegram-agent"
-    port: 4100
-    shell: true
-    env:
-      CEREBRO_URL: "http://127.0.0.1:4000"
-      PORT: "4100"

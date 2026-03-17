@@ -31,6 +31,7 @@ class TerminalInfo(BaseModel):
     service: str
     service_name: str
     pid: int
+    port: int | None = None
     command: str
     cwd: str
     status: str     # "running" | "stopped" | "error"
