@@ -85,6 +85,52 @@ class ProcessManager:
 
         return info
 
+    async def run_once(self, service_key: str, service: ServiceDefinition, command_list: list[str] = None) -> dict:
+        """
+        Ejecuta un comando de una sola vez y espera a que termine.
+        Retorna un dict con el status, exit_code y salida resumida.
+        """
+        import subprocess
+        
+        env = os.environ.copy()
+        env.update(service.env)
+        
+        cmd = command_list if command_list else service.command.split()
+        
+        logger.info(f"🏃 Ejecución one-shot en {service.cwd}: {cmd}")
+        
+        try:
+            # Usamos subprocess.run para bloquear (dentro de thread) y capturar
+            proc = await asyncio.to_thread(
+                subprocess.run,
+                cmd,
+                cwd=service.cwd,
+                env=env,
+                capture_output=True,
+                text=True,
+                shell=service.shell,
+                timeout=30 # Timeout para evitar bloqueos infinitos
+            )
+            
+            return {
+                "exit_code": proc.returncode,
+                "stdout": proc.stdout[-1000:], # Últimos 1000 chars
+                "stderr": proc.stderr[-1000:],
+                "status": "completed" if proc.returncode == 0 else "failed"
+            }
+        except subprocess.TimeoutExpired as te:
+            logger.error("⏰ Timeout agotado en ejecución one-shot")
+            return {
+                "exit_code": -1,
+                "error": "Timeout agotado (30s)",
+                "stdout": te.stdout[-500:] if te.stdout else "",
+                "stderr": te.stderr[-500:] if te.stderr else "",
+                "status": "timeout"
+            }
+        except Exception as e:
+            logger.exception("Error en run_once")
+            return {"exit_code": -1, "error": str(e), "status": "error"}
+
     async def close(self, terminal_id: str) -> bool:
         """
         Termina un proceso por su terminal_id.

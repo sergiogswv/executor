@@ -16,8 +16,10 @@ class ServiceDefinition(BaseModel):
 # ─── Comandos entrantes (Cerebro → Ejecutor) ─────────────────────────────────
 
 class ExecutorCommand(BaseModel):
-    action: str           # "open" | "close" | "status" | "list" | "kill-all"
+    action: str           # "open" | "close" | "status" | "list" | "kill-all" | "run"
     service: str | None = None      # nombre del servicio a abrir/cerrar (ej: "warden")
+    target: str | None = None       # ruta para action="run"
+    options: dict[str, Any] = {}    # opciones para action="run"
     terminal_id: str | None = None  # ID de terminal específica (para close)
     request_id: str | None = None
 

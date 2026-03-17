@@ -116,6 +116,49 @@ async def handle_command(cmd: ExecutorCommand):
         services = list(_registry.list_all().keys())
         return _ok(cmd, "services.yaml recargado", {"services": services})
 
+    # ── run (New: One-shot exec) ──────────────────────────────────────────────
+    elif cmd.action == "run":
+        if not cmd.service:
+            return _reject(cmd, "Campo 'service' requerido para action=run")
+        
+        service_def = _registry.get(cmd.service)
+        if not service_def:
+            return _reject(cmd, f"Servicio '{cmd.service}' no encontrado")
+
+        try:
+            options = cmd.options or {}
+            
+            # Limpiamos el comando base del servicio si tiene subcomandos por defecto (como 'serve')
+            cmd_base = service_def.command
+            if options.get("init") and " serve" in cmd_base:
+                cmd_base = cmd_base.replace(" serve", "")
+                
+            cmd_parts = cmd_base.split()
+            
+            # Construcción del comando: binary [subcommand] [args...]
+            if options.get("init"):
+                cmd_parts.append("init")
+                
+            if cmd.target:
+                cmd_parts.extend(["--path", cmd.target])
+                
+            if options.get("force"):
+                cmd_parts.append("--force")
+                
+            if options.get("pattern"):
+                cmd_parts.extend(["--pattern", options.get("pattern")])
+                
+            # Flag clave que acabamos de implementar en Architect
+            cmd_parts.append("--yes") 
+            
+            logger.info(f"🚀 Ejecutando comando one-shot: {' '.join(cmd_parts)}")
+            result = await _manager.run_once(cmd.service, service_def, command_list=cmd_parts)
+            
+            return _ok(cmd, "Comando ejecutado exitosamente", result)
+        except Exception as e:
+            logger.exception(f"Error ejecutando '{cmd.service}'")
+            return _reject(cmd, str(e))
+
     # ── desconocido ───────────────────────────────────────────────────────────
     else:
         return _reject(cmd, f"Acción '{cmd.action}' no reconocida")
