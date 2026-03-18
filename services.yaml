@@ -1,4 +1,4 @@
-# ─── Ejecutor — Configuración de Servicios (LINUX) ──────────────────────────────
+# ─── Ejecutor — Configuración de Servicios (MULTIPLATAFORMA) ───────────────────
 #
 # Cada entrada define un "servicio" que el Ejecutor sabe levantar.
 # El Cerebro solo necesita mandar el nombre del servicio (ej: "warden").
@@ -7,38 +7,43 @@
 # Campos:
 #   name:     Nombre legible del servicio
 #   command:  Comando a ejecutar (string o lista de args)
-#   cwd:      Directorio de trabajo (absoluto o relativo al ejecutor)
+#   cwd:      Directorio de trabajo (RELATIVO al ejecutor o absoluto)
 #   env:      Variables de entorno adicionales (opcional)
 #   port:     Puerto del servicio (solo informativo, para health checks futuros)
 #   shell:    Si ejecutar dentro de un shell (default: false)
+#
+# NOTA: Las rutas relativas se resuelven desde el directorio del ejecutor.
+#       Usa "/" como separador (Python lo convierte automáticamente en Windows)
 
 services:
 
   cerebro:
     name: "Cerebro — Orquestador"
-    command: "./venv/bin/python3 -m uvicorn app.main:app --host 0.0.0.0 --port 4000"
-    cwd: "/home/protec/skrymir-suite/cerebro"
+    command: "python -m uvicorn app.main:app --host 0.0.0.0 --port 4000"
+    cwd: "../cerebro"
     port: 4000
     shell: true
     env:
       ORCHESTRATOR_MODE: "rest"
       LOG_LEVEL: "INFO"
+      VIRTUAL_ENV: ".venv"
+      PATH: ".venv/Scripts;$PATH"
 
   warden:
     name: "Warden — Agente de Seguridad"
-    command: "./target/release/warden serve"
-    cwd: "/home/protec/skrymir-suite/warden"
+    command: "target/debug/warden serve"
+    cwd: "../warden"
     port: 4003
     shell: true
     env:
       CEREBRO_URL: "http://127.0.0.1:4000"
-      WARDEN_PORT: "4003"
       CEREBRO_REPORT_ENABLED: "true"
+      WARDEN_PORT: "4003"
 
   sentinel:
     name: "Sentinel — Agente de Monitoreo"
-    command: "./target/release/sentinel serve"
-    cwd: "/home/protec/skrymir-suite/sentinel"
+    command: "target/release/sentinel serve"
+    cwd: "../sentinel-pro"
     port: 4001
     shell: true
     env:
@@ -48,8 +53,8 @@ services:
 
   architect:
     name: "Architect Linter — Agente de Calidad"
-    command: "./target/release/architect-linter-pro serve"
-    cwd: "/home/protec/skrymir-suite/architect"
+    command: "target/release/architect-linter-pro serve"
+    cwd: "../architect-linter-pro"
     port: 4002
     shell: true
     env:

@@ -3,6 +3,7 @@ import logging
 import os
 import uuid
 import subprocess
+import platform
 from datetime import datetime, timezone
 from pathlib import Path
 from app.models import ServiceDefinition, TerminalInfo
@@ -12,6 +13,114 @@ logger = logging.getLogger("ejecutor.process_manager")
 # Directorio donde se guardan los logs de cada terminal
 LOGS_DIR = Path("logs")
 LOGS_DIR.mkdir(exist_ok=True)
+
+
+def _normalize_command(command: str, cwd: str, shell: bool) -> str:
+    r"""
+    Normaliza un comando para multiplataforma (Windows/Linux/Mac).
+
+    - Python: ajusta el intérprete (python3 en Linux/Mac, python en Windows)
+    - Binarios: detecta automáticamente la extensión (.exe en Windows, sin extensión en Linux/Mac)
+    - Rutas: convierte slashes (/ → \) en Windows cuando se usa shell
+    """
+    system = platform.system()
+    cwd_path = Path(cwd)
+
+    logger.debug(f"🔧 _normalize_command: command={command}, cwd={cwd}, system={system}")
+
+    # === Ajustes específicos para Windows ===
+    if system == "Windows":
+        # Reemplazar python3 por python (Windows no tiene python3 por defecto)
+        command = command.replace("python3", "python")
+
+        # Si el comando usa venv/Scripts/python.exe pero no existe, intentar con python del PATH
+        if "venv/Scripts/python" in command or ".venv/Scripts/python" in command:
+            venv_python_unix = cwd_path / "venv" / "Scripts" / "python.exe"
+            venv_python_dot = cwd_path / ".venv" / "Scripts" / "python.exe"
+
+            if not venv_python_unix.exists() and not venv_python_dot.exists():
+                command = command.replace(".venv/Scripts/python.exe", "python")
+                command = command.replace("venv/Scripts/python.exe", "python")
+
+    # === Detección automática de binarios (todas las plataformas) ===
+    parts = command.split()
+    if parts:
+        first_part = parts[0]
+        if ("/" in first_part or first_part.startswith("target/")) and not first_part.endswith(".exe"):
+            bin_path_clean = first_part[2:] if first_part.startswith("./") else first_part
+
+            # Primero intentar con la ruta tal cual está
+            bin_path = cwd_path / bin_path_clean.replace("/", "\\")
+            if bin_path.exists() and bin_path.is_file():
+                # El binario existe, usar path nativo
+                if system == "Windows":
+                    native_path = str(bin_path).replace("/", "\\")
+                    command = command.replace(parts[0], native_path, 1)
+                    logger.debug(f"🔧 Binario detectado (sin .exe): {first_part} → {native_path}")
+                return command
+
+            # En Windows, intentar con .exe
+            if system == "Windows":
+                bin_path_exe = cwd_path / (bin_path_clean + ".exe")
+                if bin_path_exe.exists():
+                    native_path = str(bin_path_exe).replace("/", "\\")
+                    command = command.replace(parts[0], native_path, 1)
+                    logger.debug(f"🔧 Binario detectado (.exe): {first_part} → {native_path}")
+
+    # === Convertir rutas restantes en Windows (si hay shell=True) ===
+    if system == "Windows" and shell:
+        # Convertir slashes forward a backslashes SOLO en rutas de archivo
+        # Patrones: target/release, ./target/release, ../algo/target
+        import re
+        # Solo convertir si parece una ruta (empieza con target, ., .., o contiene /)
+        command = re.sub(r'((?:\.|\.\.)?/?\w+)/(release|bin|target|Scripts|\w+-\w+)', r'\1\\\2', command)
+
+    logger.debug(f"🔧 _normalize_command result: {command}")
+    return command
+
+
+def _normalize_env(env: dict[str, str] | None, cwd: str) -> dict[str, str]:
+    r"""
+    Normaliza variables de entorno para multiplataforma.
+
+    En Windows:
+    - Convierte rutas relativas en PATH a absolutas
+    - Convierte separadores Unix (/) a Windows (\) en rutas
+    """
+    if platform.system() != "Windows":
+        return env if env else {}
+
+    if not env:
+        return {}
+
+    result = env.copy()
+    cwd_path = Path(cwd)
+
+    # Si hay PATH, convertir rutas relativas a absolutas
+    if "PATH" in result and result["PATH"]:
+        path_parts = result["PATH"].split(";")
+        normalized_parts = []
+        for part in path_parts:
+            if part in [".venv/Scripts", "venv/Scripts", ".venv\\Scripts", "venv\\Scripts"]:
+                # Ruta relativa al cwd del servicio
+                full_path = cwd_path / part.replace("/", "\\")
+                if full_path.exists():
+                    normalized_parts.append(str(full_path))
+                else:
+                    normalized_parts.append(part)
+            else:
+                normalized_parts.append(part)
+        result["PATH"] = ";".join(normalized_parts)
+
+    # Si hay VIRTUAL_ENV, convertir a ruta absoluta
+    if "VIRTUAL_ENV" in result:
+        venv_path = result["VIRTUAL_ENV"]
+        if venv_path in [".venv", "venv", "./.venv", "./venv"]:
+            full_venv = cwd_path / venv_path.replace("/", "\\")
+            if full_venv.exists():
+                result["VIRTUAL_ENV"] = str(full_venv)
+
+    return result
 
 
 class ProcessManager:
@@ -53,6 +162,8 @@ class ProcessManager:
         # Construir environment
         env = os.environ.copy()
         env.update(service.env)
+        # Normalizar environment para multiplataforma (rutas absolutas en Windows)
+        env = _normalize_env(env, service.cwd)
 
         # Archivos de log para este terminal
         log_stdout = open(LOGS_DIR / f"{terminal_id}.stdout.log", "w")
@@ -60,11 +171,17 @@ class ProcessManager:
 
         import subprocess
 
+        # Normalizar comando para multiplataforma
+        command = _normalize_command(service.command, service.cwd, service.shell)
+
+        logger.info(f"🔧 [{service_key}] Comando: {command}")
+        logger.info(f"   CWD: {service.cwd}")
+
         # Construir y ejecutar el comando usando subprocess tradicional
         # subprocess.Popen no bloquea, por lo que es seguro llamarlo en el thread principal
         if service.shell:
             proc = subprocess.Popen(
-                service.command,
+                command,
                 cwd=service.cwd,
                 env=env,
                 stdout=log_stdout,
@@ -72,7 +189,7 @@ class ProcessManager:
                 shell=True
             )
         else:
-            args = service.command.split()
+            args = command.split()
             proc = subprocess.Popen(
                 args,
                 cwd=service.cwd,
@@ -105,22 +222,46 @@ class ProcessManager:
 
         return info
 
-    async def run_once(self, service_key: str, service: ServiceDefinition, command_list: list[str] = None) -> dict:
+    async def run_once(self, service_key: str, service: ServiceDefinition, command_list: list[str] = None, timeout: int = 60) -> dict:
         """
         Ejecuta un comando de una sola vez y espera a que termine.
         Retorna un dict con el status, exit_code y salida resumida.
+
+        Args:
+            timeout: Tiempo máximo en segundos (default: 60, aumentar para análisis pesados)
         """
         import subprocess
-        
+        import platform
+        from pathlib import Path
+
         env = os.environ.copy()
         env.update(service.env)
-        
-        cmd = command_list if command_list else service.command.split()
-        
+        # Normalizar environment para multiplataforma
+        env = _normalize_env(env, service.cwd)
+
+        # Normalizar comando para multiplataforma (solo si no se proporcionó command_list)
+        if command_list is None:
+            command = _normalize_command(service.command, service.cwd, service.shell)
+            cmd = command.split()
+        else:
+            # Aplicar normalización al primer elemento (binario) para Windows
+            cmd = command_list.copy()
+            if cmd and platform.system() == "Windows":
+                bin_path = Path(service.cwd) / cmd[0].replace("/", "\\")
+                if not Path(cmd[0]).is_absolute() and bin_path.exists():
+                    cmd[0] = str(bin_path)
+                elif not Path(cmd[0]).is_absolute():
+                    bin_path_exe = Path(service.cwd) / (cmd[0] + ".exe")
+                    if bin_path_exe.exists():
+                        cmd[0] = str(bin_path_exe)
+
         logger.info(f"🏃 Ejecución one-shot en {service.cwd}: {cmd}")
-        
+
         try:
+            logger.debug(f"🔍 run_once: cmd={cmd}, cwd={service.cwd}, shell={service.shell}")
+
             # Usamos subprocess.run para bloquear (dentro de thread) y capturar
+            # errors='ignore' para evitar problemas de encoding en Windows
             proc = await asyncio.to_thread(
                 subprocess.run,
                 cmd,
@@ -129,13 +270,21 @@ class ProcessManager:
                 capture_output=True,
                 text=True,
                 shell=service.shell,
-                timeout=30 # Timeout para evitar bloqueos infinitos
+                timeout=timeout, # Timeout configurable (default: 60s)
+                errors='ignore' # Ignorar caracteres no decodificables
             )
-            
+
+            logger.debug(f"✅ proc obtenido: returncode={proc.returncode}")
+            logger.info(f"📝 stdout length: {len(proc.stdout) if proc.stdout else 0}, stderr length: {len(proc.stderr) if proc.stderr else 0}")
+            if proc.stdout:
+                logger.debug(f"📝 stdout (first 500): {proc.stdout[:500]}")
+            if proc.stderr:
+                logger.debug(f"📝 stderr (first 500): {proc.stderr[:500]}")
+
             return {
                 "exit_code": proc.returncode,
-                "stdout": proc.stdout[-1000:], # Últimos 1000 chars
-                "stderr": proc.stderr[-1000:],
+                "stdout": proc.stdout[-1000:] if proc.stdout else "", # Últimos 1000 chars
+                "stderr": proc.stderr[-1000:] if proc.stderr else "",
                 "status": "completed" if proc.returncode == 0 else "failed"
             }
         except subprocess.TimeoutExpired as te:

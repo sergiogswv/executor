@@ -120,43 +120,102 @@ async def handle_command(cmd: ExecutorCommand):
     elif cmd.action == "run":
         if not cmd.service:
             return _reject(cmd, "Campo 'service' requerido para action=run")
-        
+
         service_def = _registry.get(cmd.service)
         if not service_def:
             return _reject(cmd, f"Servicio '{cmd.service}' no encontrado")
 
         try:
             options = cmd.options or {}
-            
+
             # Limpiamos el comando base del servicio si tiene subcomandos por defecto (como 'serve')
             cmd_base = service_def.command
             if options.get("init") and " serve" in cmd_base:
                 cmd_base = cmd_base.replace(" serve", "")
-                
+
             cmd_parts = cmd_base.split()
-            
+
             # Construcción del comando: binary [subcommand] [args...]
             if options.get("init"):
                 cmd_parts.append("init")
-                
+
             if cmd.target:
                 cmd_parts.extend(["--path", cmd.target])
-                
+
             if options.get("force"):
                 cmd_parts.append("--force")
-                
+
             if options.get("pattern"):
                 cmd_parts.extend(["--pattern", options.get("pattern")])
-                
+
             # Flag clave que acabamos de implementar en Architect
-            cmd_parts.append("--yes") 
-            
+            cmd_parts.append("--yes")
+
             logger.info(f"🚀 Ejecutando comando one-shot: {' '.join(cmd_parts)}")
             result = await _manager.run_once(cmd.service, service_def, command_list=cmd_parts)
-            
+
             return _ok(cmd, "Comando ejecutado exitosamente", result)
         except Exception as e:
             logger.exception(f"Error ejecutando '{cmd.service}'")
+            return _reject(cmd, str(e))
+
+    # ── scan (Warden: análisis sobre demanda) ─────────────────────────────────
+    elif cmd.action == "scan":
+        if cmd.service != "warden":
+            return _reject(cmd, "Acción 'scan' solo disponible para warden")
+
+        # Ejecutar warden en modo one-shot sobre el target especificado
+        service_def = _registry.get("warden")
+        if not service_def:
+            return _reject(cmd, "Servicio 'warden' no encontrado")
+
+        try:
+            import shlex
+            import os
+
+            # Comando base sin el target fijo
+            # Usamos el binario debug porque el release puede estar bloqueado por un proceso en ejecucion
+            base_cmd = "target/debug/warden"
+            cmd_parts = [base_cmd]
+
+            # Agregar target (path del proyecto)
+            if cmd.target:
+                workspace_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                if os.path.isabs(cmd.target):
+                    project_path = cmd.target
+                else:
+                    project_path = os.path.join(workspace_root, cmd.target)
+                cmd_parts.append(project_path)
+            else:
+                cmd_parts.append(".")
+
+            # Agregar formato JSON
+            cmd_parts.extend(["--format", "json"])
+
+            # Opciones adicionales
+            if options := cmd.options:
+                if options.get("history"):
+                    cmd_parts.extend(["--history", options["history"]])
+                if options.get("only_predictions"):
+                    cmd_parts.append("--only-predictions")
+                if options.get("only_hotspots"):
+                    cmd_parts.append("--only-hotspots")
+                if options.get("only_trends"):
+                    cmd_parts.append("--only-trends")
+
+            logger.info(f"🔍 Warden scan ejecutando: {' '.join(cmd_parts)}")
+            # Warden puede tardar más en proyectos grandes, usar timeout de 120s
+            result = await _manager.run_once("warden", service_def, command_list=cmd_parts, timeout=120)
+
+            logger.info(f"✅ Warden scan completado: exit_code={result.get('exit_code')}, status={result.get('status')}")
+            stdout_preview = result.get('stdout', '')[:500] if result.get('stdout') else ''
+            logger.info(f"   stdout preview: {stdout_preview}...")
+            logger.info(f"   stdout contains JSON_RESULT_START: {'JSON_RESULT_START' in str(result.get('stdout', ''))}")
+            logger.debug(f"   stdout full: {result.get('stdout', '')}...")
+
+            return _ok(cmd, "Warden scan completado", result)
+        except Exception as e:
+            logger.exception(f"Error ejecutando warden scan")
             return _reject(cmd, str(e))
 
     # ── desconocido ───────────────────────────────────────────────────────────
