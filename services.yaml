@@ -60,3 +60,4 @@ services:
     env:
       CEREBRO_URL: "http://127.0.0.1:4000"
       ARCHITECT_PORT: "4002"
+      CEREBRO_REPORT_ENABLED: "true"
