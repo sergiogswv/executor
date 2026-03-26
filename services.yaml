@@ -26,12 +26,12 @@ services:
     env:
       ORCHESTRATOR_MODE: "rest"
       LOG_LEVEL: "INFO"
-      VIRTUAL_ENV: ".venv"
-      PATH: ".venv/Scripts;$PATH"
+      VIRTUAL_ENV: "../cerebro/.venv"
+      PATH: "../cerebro/.venv/Scripts"
 
   warden:
     name: "Warden — Agente de Seguridad"
-    command: "target/debug/warden serve"
+    command: "target/release/warden serve"
     cwd: "../warden"
     port: 4003
     shell: true
@@ -43,7 +43,7 @@ services:
   sentinel:
     name: "Sentinel — Agente de Monitoreo"
     command: "target/release/sentinel serve"
-    cwd: "../sentinel-pro"
+    cwd: "../sentinel"
     port: 4001
     shell: true
     env:
@@ -54,7 +54,7 @@ services:
   architect:
     name: "Architect Linter — Agente de Calidad"
     command: "target/release/architect-linter-pro serve"
-    cwd: "../architect-linter-pro"
+    cwd: "../architect"
     port: 4002
     shell: true
     env:

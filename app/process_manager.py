@@ -21,61 +21,70 @@ def _normalize_command(command: str, cwd: str, shell: bool) -> str:
 
     - Python: ajusta el intérprete (python3 en Linux/Mac, python en Windows)
     - Binarios: detecta automáticamente la extensión (.exe en Windows, sin extensión en Linux/Mac)
-    - Rutas: convierte slashes (/ → \) en Windows cuando se usa shell
+    - Rutas: convierte todos los slashes (/ → \) en Windows
     """
     system = platform.system()
     cwd_path = Path(cwd)
 
     logger.debug(f"🔧 _normalize_command: command={command}, cwd={cwd}, system={system}")
 
-    # === Ajustes específicos para Windows ===
+    # === Paso 1: Normalizar todos los slashes según la plataforma ===
     if system == "Windows":
+        # Convertir todos los / a \ para Windows
+        command = command.replace("/", "\\")
         # Reemplazar python3 por python (Windows no tiene python3 por defecto)
         command = command.replace("python3", "python")
+    else:
+        # En Unix, asegurar que los slashes sean /
+        command = command.replace("\\", "/")
 
-        # Si el comando usa venv/Scripts/python.exe pero no existe, intentar con python del PATH
-        if "venv/Scripts/python" in command or ".venv/Scripts/python" in command:
-            venv_python_unix = cwd_path / "venv" / "Scripts" / "python.exe"
+    logger.debug(f"🔧 Después de normalizar slashes: {command}")
+
+    # === Paso 2: Ajustes específicos de Python en Windows ===
+    if system == "Windows":
+        # Si el comando usa venv\Scripts\python.exe pero no existe, intentar con python del PATH
+        if "venv\\Scripts\\python" in command or ".venv\\Scripts\\python" in command:
+            venv_python_win = cwd_path / "venv" / "Scripts" / "python.exe"
             venv_python_dot = cwd_path / ".venv" / "Scripts" / "python.exe"
 
-            if not venv_python_unix.exists() and not venv_python_dot.exists():
-                command = command.replace(".venv/Scripts/python.exe", "python")
-                command = command.replace("venv/Scripts/python.exe", "python")
+            if not venv_python_win.exists() and not venv_python_dot.exists():
+                command = command.replace(".venv\\Scripts\\python.exe", "python")
+                command = command.replace("venv\\Scripts\\python.exe", "python")
 
-    # === Detección automática de binarios (todas las plataformas) ===
+    # === Paso 3: Detección automática de binarios y agregar .exe en Windows ===
     parts = command.split()
     if parts:
         first_part = parts[0]
-        if ("/" in first_part or first_part.startswith("target/")) and not first_part.endswith(".exe"):
-            bin_path_clean = first_part[2:] if first_part.startswith("./") else first_part
+        # Solo procesar si parece una ruta relativa (contiene separador de ruta)
+        separator = "\\" if system == "Windows" else "/"
+        if separator in first_part:
+            # Ruta relativa desde cwd
+            bin_path = cwd_path / first_part
 
-            # Primero intentar con la ruta tal cual está
-            bin_path = cwd_path / bin_path_clean.replace("/", "\\")
+            # Intentar con la ruta exacta primero
             if bin_path.exists() and bin_path.is_file():
-                # El binario existe, usar path nativo
-                if system == "Windows":
-                    native_path = str(bin_path).replace("/", "\\")
-                    command = command.replace(parts[0], native_path, 1)
-                    logger.debug(f"🔧 Binario detectado (sin .exe): {first_part} → {native_path}")
+                logger.debug(f"🔧 Binario encontrado: {bin_path}")
                 return command
 
             # En Windows, intentar con .exe
-            if system == "Windows":
-                bin_path_exe = cwd_path / (bin_path_clean + ".exe")
+            if system == "Windows" and not first_part.lower().endswith(".exe"):
+                bin_path_exe = cwd_path / (first_part + ".exe")
                 if bin_path_exe.exists():
-                    native_path = str(bin_path_exe).replace("/", "\\")
-                    command = command.replace(parts[0], native_path, 1)
-                    logger.debug(f"🔧 Binario detectado (.exe): {first_part} → {native_path}")
+                    command = command.replace(first_part, first_part + ".exe", 1)
+                    logger.debug(f"🔧 Binario detectado (.exe agregada): {first_part} → {first_part}.exe")
+                    return command
 
-    # === Convertir rutas restantes en Windows (si hay shell=True) ===
-    if system == "Windows" and shell:
-        # Convertir slashes forward a backslashes SOLO en rutas de archivo
-        # Patrones: target/release, ./target/release, ../algo/target
-        import re
-        # Solo convertir si parece una ruta (empieza con target, ., .., o contiene /)
-        command = re.sub(r'((?:\.|\.\.)?/?\w+)/(release|bin|target|Scripts|\w+-\w+)', r'\1\\\2', command)
+            # En Windows, también intentar en la carpeta release/debug con .exe
+            if system == "Windows":
+                # Intentar variante .exe en la misma ruta
+                base_with_exe = first_part + ".exe"
+                bin_path_alt = cwd_path / base_with_exe
+                if bin_path_alt.exists():
+                    command = command.replace(first_part, base_with_exe, 1)
+                    logger.debug(f"🔧 Binario alternativo encontrado: {base_with_exe}")
+                    return command
 
-    logger.debug(f"🔧 _normalize_command result: {command}")
+    logger.debug(f"🔧 _normalize_command final: {command}")
     return command
 
 
@@ -83,42 +92,53 @@ def _normalize_env(env: dict[str, str] | None, cwd: str) -> dict[str, str]:
     r"""
     Normaliza variables de entorno para multiplataforma.
 
-    En Windows:
-    - Convierte rutas relativas en PATH a absolutas
-    - Convierte separadores Unix (/) a Windows (\) en rutas
+    - Resuelve rutas relativas a absolutas
+    - Windows: usa \ como separador y Scripts/
+    - Unix: usa / como separador y bin/
     """
-    if platform.system() != "Windows":
-        return env if env else {}
-
     if not env:
         return {}
 
     result = env.copy()
     cwd_path = Path(cwd)
+    system = platform.system()
 
     # Si hay PATH, convertir rutas relativas a absolutas
     if "PATH" in result and result["PATH"]:
-        path_parts = result["PATH"].split(";")
+        separator = ";" if system == "Windows" else ":"
+        scripts_dir = "Scripts" if system == "Windows" else "bin"
+
+        path_parts = result["PATH"].split(separator)
         normalized_parts = []
         for part in path_parts:
-            if part in [".venv/Scripts", "venv/Scripts", ".venv\\Scripts", "venv\\Scripts"]:
-                # Ruta relativa al cwd del servicio
-                full_path = cwd_path / part.replace("/", "\\")
+            # Detectar rutas relativas de venv (.venv/Scripts, ../cerebro/.venv/Scripts, etc.)
+            if "venv" in part.lower() and (scripts_dir in part or "bin" in part):
+                # Normalizar separadores
+                part_normalized = part.replace("/", "\\").replace("\\", "/")
+                full_path = cwd_path / part_normalized.replace("/", "\\")
                 if full_path.exists():
-                    normalized_parts.append(str(full_path))
+                    # Convertir a ruta absoluta nativa
+                    native_path = str(full_path.resolve())
+                    if system != "Windows":
+                        native_path = native_path.replace("\\", "/")
+                    normalized_parts.append(native_path)
                 else:
                     normalized_parts.append(part)
             else:
                 normalized_parts.append(part)
-        result["PATH"] = ";".join(normalized_parts)
+        result["PATH"] = separator.join(normalized_parts)
 
     # Si hay VIRTUAL_ENV, convertir a ruta absoluta
     if "VIRTUAL_ENV" in result:
         venv_path = result["VIRTUAL_ENV"]
-        if venv_path in [".venv", "venv", "./.venv", "./venv"]:
+        # Solo procesar si es ruta relativa (no empieza con / o letra: en Windows)
+        if not Path(venv_path).is_absolute():
             full_venv = cwd_path / venv_path.replace("/", "\\")
             if full_venv.exists():
-                result["VIRTUAL_ENV"] = str(full_venv)
+                resolved = str(full_venv.resolve())
+                if system != "Windows":
+                    resolved = resolved.replace("\\", "/")
+                result["VIRTUAL_ENV"] = resolved
 
     return result
 
