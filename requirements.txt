@@ -5,3 +5,4 @@ pydantic
 pydantic-settings
 python-dotenv
 pyyaml
+aider-chat

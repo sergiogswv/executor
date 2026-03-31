@@ -218,6 +218,237 @@ async def handle_command(cmd: ExecutorCommand):
             logger.exception(f"Error ejecutando warden scan")
             return _reject(cmd, str(e))
 
+    # ── autofix (Cerebro: Ejecución autónoma de tareas Nivel 5) ───────────────
+    elif cmd.action == "autofix":
+        options = cmd.options or {}
+        instruction = options.get("instruction", "")
+        branch_prefix = options.get("branch_prefix", "skrymir-fix/")
+        provider = options.get("provider", "ollama")
+        model = options.get("model", "qwen3:8b")
+        target_file = cmd.target
+
+        if not target_file or not instruction:
+            return _reject(cmd, "Falta 'target' (archivo) o 'instruction' para autofix")
+
+        try:
+            import os
+            import sys
+            import subprocess
+            from pathlib import Path
+
+            workspace_root = options.get("workspace_root")
+            if not workspace_root:
+                workspace_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            
+            # Arreglar lógica para detectar el cwd correcto 
+            # (si target_file ya es un directorio, usar ese, sino su directorio)
+            if os.path.isdir(target_file):
+                project_path = target_file
+            else:
+                project_path = os.path.dirname(target_file)
+                
+            if not os.path.isabs(project_path):
+                project_path = os.path.join(workspace_root, project_path)
+
+            if not os.path.isdir(project_path):
+                project_path = workspace_root
+
+            import uuid
+            
+            branch_name = f"{branch_prefix}{uuid.uuid4().hex[:6]}"
+
+            logger.info(f"🌿 Autofix: cwd={project_path} | aislando en nueva rama {branch_name}...")
+            # Git checkout isolation
+            subprocess.run(["git", "stash"], cwd=project_path, capture_output=True)
+            checkout_res = subprocess.run(["git", "checkout", "-b", branch_name], cwd=project_path, capture_output=True, text=True)
+            if checkout_res.returncode != 0 and "fatal: not a git repository" in checkout_res.stderr:
+                logger.warning("No es un repositorio Git, ignorando comando checkout")
+            
+            # Localizar uv (el gestor que instala y ejecuta correctamente aider)
+            import shutil, os
+
+            # uv se instala en el Scripts de Python del sistema
+            uv_bin = shutil.which("uv") or r"C:\Users\Sergio\AppData\Local\Programs\Python\Python313\Scripts\uv.exe"
+            logger.info(f"🤖 uv localizado en: {uv_bin} | Ejecutando Aider...")
+            
+            # Comando via 'uv tool run --from aider-chat' que activa correctamente el venv de aider
+            aider_cmd = [uv_bin, "tool", "run", "--from", "aider-chat", "aider", "--yes", "--no-show-model-warnings", "--message", instruction]
+            
+            # Solo pasamos el file si es un archivo real
+            if os.path.isfile(target_file):
+                aider_cmd.append(target_file)
+            
+            auto_fix_env = os.environ.copy()
+
+            if provider == "ollama":
+                auto_fix_env["OLLAMA_API_BASE"] = "http://localhost:11434"
+                auto_fix_env["OLLAMA_API_KEY"] = "sk-ollama-dummy"
+                aider_cmd.extend(["--model", f"ollama_chat/{model}"])
+            elif provider == "anthropic":
+                aider_cmd.extend(["--model", "anthropic/claude-3-5-sonnet"])
+            
+            # Lanzamos subproceso usando _manager.run_once con un servicio sintetico
+            from app.models import ServiceDefinition
+            auto_fix_svc = ServiceDefinition(
+                name="autofix_agent",
+                command=uv_bin,
+                cwd=project_path,
+                env=auto_fix_env,
+                shell=False
+            )
+
+            # Puede tardar hasta 3 minutos un fix
+            result = await _manager.run_once("autofix_agent", auto_fix_svc, command_list=aider_cmd, timeout=180)
+
+            exit_code = result.get("exit_code", -1)
+            stdout_out = result.get("stdout", "") or ""
+            stderr_out = result.get("stderr", "") or ""
+
+            # ── CAPTURAR ARCHIVOS MODIFICADOS POR AIDER ───────────────────────────
+            modified_files = []
+            git_diff = ""
+            git_status = ""
+            try:
+                # Obtener lista de archivos modificados
+                status_res = subprocess.run(
+                    ["git", "status", "--short"],
+                    cwd=project_path, capture_output=True, text=True, timeout=10
+                )
+                git_status = status_res.stdout
+
+                # Parsear archivos modificados/agregados
+                for line in git_status.split('\n'):
+                    if line.strip():
+                        # Formato: " M path/to/file" o "A  path/to/file"
+                        parts = line.strip().split(maxsplit=1)
+                        if len(parts) == 2:
+                            status_code, file_path = parts
+                            modified_files.append({
+                                "path": file_path,
+                                "status": status_code  # M=modified, A=added, D=deleted, ??=untracked
+                            })
+
+                # Obtener diff de cambios
+                if modified_files:
+                    diff_res = subprocess.run(
+                        ["git", "diff", "--no-color", "--stat"],
+                        cwd=project_path, capture_output=True, text=True, timeout=10
+                    )
+                    git_diff_stat = diff_res.stdout
+
+                    # Diff completo (limitado para no sobrecargar)
+                    diff_full_res = subprocess.run(
+                        ["git", "diff", "--no-color"],
+                        cwd=project_path, capture_output=True, text=True, timeout=15
+                    )
+                    git_diff = diff_full_res.stdout[:5000]  # Limitar a 5KB
+
+                logger.info(f"📁 Archivos modificados por Aider: {len(modified_files)}")
+                for f in modified_files[:5]:
+                    logger.info(f"   {f['status']} {f['path']}")
+                if len(modified_files) > 5:
+                    logger.info(f"   ... y {len(modified_files) - 5} más")
+
+            except Exception as git_err:
+                logger.warning(f"⚠️ No se pudo capturar git diff: {git_err}")
+
+            if exit_code != 0:
+                logger.error(f"❌ Aider falló (código={exit_code})")
+                logger.error(f"   STDERR: {stderr_out[:500]}")
+                logger.error(f"   STDOUT: {stdout_out[:500]}")
+                return _ok(cmd, f"Autofix falló en rama {branch_name}", {
+                    "branch": branch_name,
+                    "aider_exit_code": exit_code,
+                    "fix_validated": False,
+                    "validation_skipped": True,
+                    "error": stderr_out[:500],
+                    # Incluir info de archivos aunque falle
+                    "modified_files": modified_files,
+                    "git_diff_stat": git_diff[:1000] if git_diff else None,
+                    "git_status": git_status[:500] if git_status else None,
+                })
+
+            logger.info(f"✅ Aider completó el fix. Iniciando Validation Gate...")
+
+            # ── VALIDATION GATE ──────────────────────────────────────────────────
+            # Detectar el tipo de proyecto y elegir el comando de build correcto
+            build_cmd = None
+            build_tool = None
+
+            if os.path.isfile(os.path.join(project_path, "package.json")):
+                build_tool = "nodejs"
+                # npm install por si Aider agregó dependencias nuevas
+                logger.info("📦 Node.js detectado. Ejecutando npm install...")
+                await asyncio.to_thread(
+                    subprocess.run,
+                    ["npm", "install"],
+                    cwd=project_path,
+                    capture_output=True,
+                    timeout=120,
+                    shell=True
+                )
+                build_cmd = ["npm", "run", "build"]
+
+            elif os.path.isfile(os.path.join(project_path, "Cargo.toml")):
+                build_tool = "rust"
+                build_cmd = ["cargo", "build"]
+
+            elif os.path.isfile(os.path.join(project_path, "pyproject.toml")) or \
+                 os.path.isfile(os.path.join(project_path, "setup.py")):
+                build_tool = "python"
+                build_cmd = ["python", "-m", "py_compile"]
+
+            fix_validated = False
+            build_exit_code = None
+            build_output = ""
+
+            if build_cmd:
+                logger.info(f"🔨 [{build_tool}] Ejecutando: {' '.join(build_cmd)}")
+                build_svc = ServiceDefinition(
+                    name=f"validate_{build_tool}",
+                    command=build_cmd[0],
+                    cwd=project_path,
+                    env=auto_fix_env,
+                    shell=True
+                )
+                build_result = await _manager.run_once(
+                    f"validate_{build_tool}", build_svc,
+                    command_list=build_cmd, timeout=120
+                )
+                build_exit_code = build_result.get("exit_code", -1)
+                build_output = (build_result.get("stdout") or "") + (build_result.get("stderr") or "")
+
+                if build_exit_code == 0:
+                    fix_validated = True
+                    logger.info(f"✅ Validation Gate PASÓ — Build exitoso en rama {branch_name}")
+                else:
+                    fix_validated = False
+                    logger.warning(f"⚠️ Validation Gate FALLÓ — Build roto. Fix no aplicable sin revisión.")
+                    logger.warning(f"   Build output: {build_output[:500]}")
+            else:
+                logger.info("⚠️ No se detectó build tool conocido. Validación omitida.")
+                fix_validated = None  # None = no aplica / indeterminado
+
+            return _ok(cmd, f"Autofix finalizado en rama {branch_name}", {
+                "branch": branch_name,
+                "aider_exit_code": exit_code,
+                "fix_validated": fix_validated,
+                "build_tool": build_tool,
+                "build_exit_code": build_exit_code,
+                "aider_output": stdout_out[:1000],
+                "build_output": build_output[:1000],
+                # Info detallada de archivos modificados
+                "modified_files": modified_files,
+                "git_diff_stat": git_diff[:2000] if git_diff else None,
+                "git_diff_full": git_diff[:8000] if git_diff else None,
+                "git_status": git_status[:500] if git_status else None,
+                "files_count": len(modified_files),
+            })
+
+        except Exception as e:
+            logger.exception("Error en Autofix")
+            return _reject(cmd, str(e))
+
     # ── desconocido ───────────────────────────────────────────────────────────
     else:
         return _reject(cmd, f"Acción '{cmd.action}' no reconocida")

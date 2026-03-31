@@ -28,6 +28,7 @@ services:
       LOG_LEVEL: "INFO"
       VIRTUAL_ENV: "../cerebro/.venv"
       PATH: "../cerebro/.venv/Scripts"
+      PYTHONIOENCODING: "utf-8"
 
   warden:
     name: "Warden — Agente de Seguridad"
@@ -39,6 +40,18 @@ services:
       CEREBRO_URL: "http://127.0.0.1:4000"
       CEREBRO_REPORT_ENABLED: "true"
       WARDEN_PORT: "4003"
+
+  warden_adk:
+    name: "Warden ADK — Sidecar IA"
+    command: "python -m uvicorn warden_agent.main:app --host 0.0.0.0 --port 4013"
+    cwd: "../warden"
+    port: 4013
+    shell: true
+    env:
+      CEREBRO_URL: "http://127.0.0.1:4000"
+      VIRTUAL_ENV: "../warden/.venv"
+      PATH: "../warden/.venv/Scripts"
+      PYTHONIOENCODING: "utf-8"
 
   sentinel:
     name: "Sentinel — Agente de Monitoreo"
@@ -61,3 +74,16 @@ services:
       CEREBRO_URL: "http://127.0.0.1:4000"
       ARCHITECT_PORT: "4002"
       CEREBRO_REPORT_ENABLED: "true"
+
+  architect_adk:
+    name: "Architect ADK — Sidecar IA"
+    command: "python -m uvicorn architect_ai.main:app --host 0.0.0.0 --port 4012"
+    cwd: "../architect"
+    port: 4012
+    shell: true
+    env:
+      CEREBRO_URL: "http://127.0.0.1:4000"
+      ARCHITECT_ADK_PORT: "4012"
+      VIRTUAL_ENV: "../architect/.venv"
+      PATH: "../architect/.venv/Scripts"
+      PYTHONIOENCODING: "utf-8"
