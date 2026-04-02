@@ -1,4 +1,8 @@
 import logging
+import os
+import shutil
+import subprocess
+from datetime import datetime
 from fastapi import APIRouter, HTTPException
 from app.models import ExecutorCommand, CommandAck, ApiResponse, TerminalInfo
 from app.registry import ServiceRegistry
@@ -171,7 +175,6 @@ async def handle_command(cmd: ExecutorCommand):
 
         try:
             import shlex
-            import os
 
             # Comando base sin el target fijo
             # Usamos el binario debug porque el release puede estar bloqueado por un proceso en ejecucion
@@ -265,8 +268,6 @@ async def handle_command(cmd: ExecutorCommand):
                 logger.warning("No es un repositorio Git, ignorando comando checkout")
             
             # Localizar uv (el gestor que instala y ejecuta correctamente aider)
-            import shutil, os
-
             # uv se instala en el Scripts de Python del sistema
             uv_bin = shutil.which("uv") or r"C:\Users\Sergio\AppData\Local\Programs\Python\Python313\Scripts\uv.exe"
             logger.info(f"🤖 uv localizado en: {uv_bin} | Ejecutando Aider...")
@@ -287,6 +288,42 @@ async def handle_command(cmd: ExecutorCommand):
             elif provider == "anthropic":
                 aider_cmd.extend(["--model", "anthropic/claude-3-5-sonnet"])
             
+            # ── BACKUP DE ARCHIVOS ORIGINALES (.bak) ───────────────────────────────
+            # Identificar archivos que podrían modificarse y crear backup
+            backup_files = []
+            suggested_files = []  # Para trazabilidad de archivos .suggested
+            files_to_backup = []
+
+            # Si target_file es un archivo, solo hacer backup de ese
+            if os.path.isfile(target_file):
+                files_to_backup.append(target_file)
+            else:
+                # Buscar archivos del proyecto que podrían modificarse
+                # (Aider típicamente modifica archivos del contexto)
+                try:
+                    for root, dirs, files in os.walk(project_path):
+                        # Ignorar directorios comunes
+                        dirs[:] = [d for d in dirs if d not in ('node_modules', '.git', '__pycache__', 'venv', 'dist', 'build')]
+                        for file in files:
+                            if file.endswith(('.ts', '.tsx', '.js', '.jsx', '.py', '.rs', '.go', '.java')):
+                                files_to_backup.append(os.path.join(root, file))
+                except Exception as walk_err:
+                    logger.warning(f"⚠️ No se pudo listar archivos para backup: {walk_err}")
+
+            # Crear backups (.bak) antes de modificar
+            logger.info(f"💾 Creando backups de {len(files_to_backup)} archivos...")
+            backup_count = 0
+            for file_path in files_to_backup:
+                try:
+                    bak_path = file_path + ".bak"
+                    shutil.copy2(file_path, bak_path)
+                    backup_files.append({"original": file_path, "backup": bak_path})
+                    backup_count += 1
+                except Exception as copy_err:
+                    logger.warning(f"⚠️ No se pudo hacer backup de {file_path}: {copy_err}")
+
+            logger.info(f"✅ {backup_count} archivos respaldados con .bak")
+
             # Lanzamos subproceso usando _manager.run_once con un servicio sintetico
             from app.models import ServiceDefinition
             auto_fix_svc = ServiceDefinition(
@@ -297,8 +334,8 @@ async def handle_command(cmd: ExecutorCommand):
                 shell=False
             )
 
-            # Puede tardar hasta 3 minutos un fix
-            result = await _manager.run_once("autofix_agent", auto_fix_svc, command_list=aider_cmd, timeout=180)
+            # Puede tardar hasta 5 minutos un fix (aider + build puede ser lento)
+            result = await _manager.run_once("autofix_agent", auto_fix_svc, command_list=aider_cmd, timeout=300)
 
             exit_code = result.get("exit_code", -1)
             stdout_out = result.get("stdout", "") or ""
@@ -352,8 +389,13 @@ async def handle_command(cmd: ExecutorCommand):
             except Exception as git_err:
                 logger.warning(f"⚠️ No se pudo capturar git diff: {git_err}")
 
-            if exit_code != 0:
-                logger.error(f"❌ Aider falló (código={exit_code})")
+            # Verificar si hay archivos modificados (ignorando .gitignore, architect.json, etc.)
+            meaningful_files = [f for f in modified_files if not f['path'].endswith(('.gitignore', 'architect.json', 'report.json'))]
+
+            # Si Aider reportó error pero hay archivos modificados, igual intentar el build
+            # A veces Aider funciona pero falla el resumen al final
+            if exit_code != 0 and not meaningful_files:
+                logger.error(f"❌ Aider falló (código={exit_code}) y no se modificaron archivos significativos")
                 logger.error(f"   STDERR: {stderr_out[:500]}")
                 logger.error(f"   STDOUT: {stdout_out[:500]}")
                 return _ok(cmd, f"Autofix falló en rama {branch_name}", {
@@ -362,13 +404,15 @@ async def handle_command(cmd: ExecutorCommand):
                     "fix_validated": False,
                     "validation_skipped": True,
                     "error": stderr_out[:500],
-                    # Incluir info de archivos aunque falle
                     "modified_files": modified_files,
                     "git_diff_stat": git_diff[:1000] if git_diff else None,
                     "git_status": git_status[:500] if git_status else None,
                 })
 
-            logger.info(f"✅ Aider completó el fix. Iniciando Validation Gate...")
+            if exit_code != 0 and meaningful_files:
+                logger.warning(f"⚠️ Aider reportó error (código={exit_code}) pero modificó {len(meaningful_files)} archivos. Intentando build...")
+            else:
+                logger.info(f"✅ Aider completó el fix. Iniciando Validation Gate...")
 
             # ── VALIDATION GATE ──────────────────────────────────────────────────
             # Detectar el tipo de proyecto y elegir el comando de build correcto
@@ -421,13 +465,65 @@ async def handle_command(cmd: ExecutorCommand):
                 if build_exit_code == 0:
                     fix_validated = True
                     logger.info(f"✅ Validation Gate PASÓ — Build exitoso en rama {branch_name}")
+                    # Build pasó: mantener .bak y el archivo modificado
+                    logger.info(f"💾 Backups .bak mantenidos por seguridad")
                 else:
                     fix_validated = False
                     logger.warning(f"⚠️ Validation Gate FALLÓ — Build roto. Fix no aplicable sin revisión.")
                     logger.warning(f"   Build output: {build_output[:500]}")
+
+                    # ── MANEJO DE ARCHIVOS CUANDO BUILD FALLA ─────────────────────────
+                    logger.info("🔄 Restaurando archivos originales desde .bak y creando .suggested...")
+
+                    for backup_info in backup_files:
+                        original_path = backup_info["original"]
+                        bak_path = backup_info["backup"]
+
+                        try:
+                            # Verificar si el archivo fue modificado
+                            if os.path.exists(original_path) and os.path.exists(bak_path):
+                                # Leer contenido original y modificado
+                                with open(original_path, 'r', encoding='utf-8') as f:
+                                    modified_content = f.read()
+                                with open(bak_path, 'r', encoding='utf-8') as f:
+                                    original_content = f.read()
+
+                                # Solo si hay diferencias, crear .suggested
+                                if modified_content != original_content:
+                                    suggested_path = original_path + ".suggested"
+                                    with open(suggested_path, 'w', encoding='utf-8') as f:
+                                        f.write(f"# Suggested fix for: {os.path.basename(original_path)}\n")
+                                        f.write(f"# Timestamp: {datetime.now().isoformat()}\n")
+                                        f.write(f"# Branch: {branch_name}\n")
+                                        f.write(f"# Build failed with exit code: {build_exit_code}\n")
+                                        f.write(f"# --- ORIGINAL ---\n")
+                                        f.write(original_content)
+                                        f.write(f"\n# --- SUGGESTED ---\n")
+                                        f.write(modified_content)
+
+                                    suggested_files.append({
+                                        "original": original_path,
+                                        "suggested": suggested_path,
+                                        "backup": bak_path
+                                    })
+                                    logger.info(f"   📝 Creado .suggested: {suggested_path}")
+
+                                # Restaurar archivo original desde .bak
+                                shutil.copy2(bak_path, original_path)
+                                logger.info(f"   ✅ Restaurado original: {original_path}")
+
+                                # Eliminar .bak (el usuario pidió que se elimine si build falla)
+                                os.remove(bak_path)
+                                logger.info(f"   🗑️ Eliminado .bak: {bak_path}")
+
+                        except Exception as restore_err:
+                            logger.error(f"   ❌ Error restaurando {original_path}: {restore_err}")
+
             else:
                 logger.info("⚠️ No se detectó build tool conocido. Validación omitida.")
                 fix_validated = None  # None = no aplica / indeterminado
+                # Sin build tool, mantener .bak como precaución
+                logger.info(f"💾 Backups .bak mantenidos (no hay build para validar)")
 
             return _ok(cmd, f"Autofix finalizado en rama {branch_name}", {
                 "branch": branch_name,
@@ -443,6 +539,10 @@ async def handle_command(cmd: ExecutorCommand):
                 "git_diff_full": git_diff[:8000] if git_diff else None,
                 "git_status": git_status[:500] if git_status else None,
                 "files_count": len(modified_files),
+                # Info de trazabilidad de backups y suggested
+                "backup_count": len(backup_files),
+                "suggested_files": suggested_files,
+                "suggested_count": len(suggested_files),
             })
 
         except Exception as e:

@@ -308,10 +308,10 @@ class ProcessManager:
                 "status": "completed" if proc.returncode == 0 else "failed"
             }
         except subprocess.TimeoutExpired as te:
-            logger.error("⏰ Timeout agotado en ejecución one-shot")
+            logger.error(f"⏰ Timeout agotado en ejecución one-shot ({timeout}s)")
             return {
                 "exit_code": -1,
-                "error": "Timeout agotado (30s)",
+                "error": f"Timeout agotado ({timeout}s)",
                 "stdout": te.stdout[-500:] if te.stdout else "",
                 "stderr": te.stderr[-500:] if te.stderr else "",
                 "status": "timeout"

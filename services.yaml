@@ -87,3 +87,17 @@ services:
       VIRTUAL_ENV: "../architect/.venv"
       PATH: "../architect/.venv/Scripts"
       PYTHONIOENCODING: "utf-8"
+
+  sentinel_adk:
+    name: "Sentinel ADK — Sidecar IA"
+    command: "python -m uvicorn sentinel_adk.main:app --host 0.0.0.0 --port 4011"
+    cwd: "../sentinel"
+    port: 4011
+    shell: true
+    env:
+      CEREBRO_URL: "http://127.0.0.1:4000"
+      SENTINEL_ADK_PORT: "4011"
+      SENTINEL_CORE_URL: "http://127.0.0.1:4001"
+      VIRTUAL_ENV: "../sentinel/.venv"
+      PATH: "../sentinel/.venv/Scripts"
+      PYTHONIOENCODING: "utf-8"
