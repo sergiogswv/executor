@@ -3,7 +3,8 @@ import os
 import shutil
 import subprocess
 from datetime import datetime
-from fastapi import APIRouter, HTTPException
+import asyncio
+from fastapi import APIRouter, HTTPException, BackgroundTasks
 from app.models import ExecutorCommand, CommandAck, ApiResponse, TerminalInfo
 from app.registry import ServiceRegistry
 from app.process_manager import ProcessManager
@@ -25,7 +26,7 @@ def init(registry: ServiceRegistry, manager: ProcessManager) -> None:
 # ─── POST /command — Recibir instrucción del Cerebro ─────────────────────────
 
 @router.post("/command", response_model=ApiResponse)
-async def handle_command(cmd: ExecutorCommand):
+async def handle_command(cmd: ExecutorCommand, background_tasks: BackgroundTasks):
     """
     Endpoint principal. El Cerebro envía instrucciones aquí.
 
@@ -221,8 +222,8 @@ async def handle_command(cmd: ExecutorCommand):
             logger.exception(f"Error ejecutando warden scan")
             return _reject(cmd, str(e))
 
-    # ── autofix (Cerebro: Ejecución autónoma de tareas Nivel 5) ───────────────
-    elif cmd.action == "autofix":
+    # ── autofix / feature / bugfix (Ejecución de cambios mediante Aider) ───────
+    elif cmd.action in ("autofix", "feature", "bugfix"):
         options = cmd.options or {}
         instruction = options.get("instruction", "")
         branch_prefix = options.get("branch_prefix", "skrymir-fix/")
@@ -230,324 +231,308 @@ async def handle_command(cmd: ExecutorCommand):
         model = options.get("model", "qwen3:8b")
         target_file = cmd.target
 
-        if not target_file or not instruction:
-            return _reject(cmd, "Falta 'target' (archivo) o 'instruction' para autofix")
+        if target_file is None:
+            target_file = ""
 
-        try:
-            import os
-            import sys
-            import subprocess
-            from pathlib import Path
+        if not instruction:
+            return _reject(cmd, "Falta 'instruction' para la iteración")
+        if cmd.action == "autofix" and not target_file:
+            return _reject(cmd, "Falta 'target' (archivo) obligatorio para autofix")
 
-            workspace_root = options.get("workspace_root")
-            if not workspace_root:
-                workspace_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            
-            # Arreglar lógica para detectar el cwd correcto 
-            # (si target_file ya es un directorio, usar ese, sino su directorio)
-            if os.path.isdir(target_file):
-                project_path = target_file
-            else:
-                project_path = os.path.dirname(target_file)
-                
-            if not os.path.isabs(project_path):
-                project_path = os.path.join(workspace_root, project_path)
-
-            if not os.path.isdir(project_path):
-                project_path = workspace_root
-
-            import uuid
-            
-            branch_name = f"{branch_prefix}{uuid.uuid4().hex[:6]}"
-
-            logger.info(f"🌿 Autofix: cwd={project_path} | aislando en nueva rama {branch_name}...")
-            # Git checkout isolation
-            subprocess.run(["git", "stash"], cwd=project_path, capture_output=True)
-            checkout_res = subprocess.run(["git", "checkout", "-b", branch_name], cwd=project_path, capture_output=True, text=True)
-            if checkout_res.returncode != 0 and "fatal: not a git repository" in checkout_res.stderr:
-                logger.warning("No es un repositorio Git, ignorando comando checkout")
-            
-            # Localizar uv (el gestor que instala y ejecuta correctamente aider)
-            # uv se instala en el Scripts de Python del sistema
-            uv_bin = shutil.which("uv") or r"C:\Users\Sergio\AppData\Local\Programs\Python\Python313\Scripts\uv.exe"
-            logger.info(f"🤖 uv localizado en: {uv_bin} | Ejecutando Aider...")
-            
-            # Comando via 'uv tool run --from aider-chat' que activa correctamente el venv de aider
-            aider_cmd = [uv_bin, "tool", "run", "--from", "aider-chat", "aider", "--yes", "--no-show-model-warnings", "--message", instruction]
-            
-            # Solo pasamos el file si es un archivo real
-            if os.path.isfile(target_file):
-                aider_cmd.append(target_file)
-            
-            auto_fix_env = os.environ.copy()
-
-            if provider == "ollama":
-                auto_fix_env["OLLAMA_API_BASE"] = "http://localhost:11434"
-                auto_fix_env["OLLAMA_API_KEY"] = "sk-ollama-dummy"
-                aider_cmd.extend(["--model", f"ollama_chat/{model}"])
-            elif provider == "anthropic":
-                aider_cmd.extend(["--model", "anthropic/claude-3-5-sonnet"])
-            
-            # ── BACKUP DE ARCHIVOS ORIGINALES (.bak) ───────────────────────────────
-            # Identificar archivos que podrían modificarse y crear backup
-            backup_files = []
-            suggested_files = []  # Para trazabilidad de archivos .suggested
-            files_to_backup = []
-
-            # Si target_file es un archivo, solo hacer backup de ese
-            if os.path.isfile(target_file):
-                files_to_backup.append(target_file)
-            else:
-                # Buscar archivos del proyecto que podrían modificarse
-                # (Aider típicamente modifica archivos del contexto)
-                try:
-                    for root, dirs, files in os.walk(project_path):
-                        # Ignorar directorios comunes
-                        dirs[:] = [d for d in dirs if d not in ('node_modules', '.git', '__pycache__', 'venv', 'dist', 'build')]
-                        for file in files:
-                            if file.endswith(('.ts', '.tsx', '.js', '.jsx', '.py', '.rs', '.go', '.java')):
-                                files_to_backup.append(os.path.join(root, file))
-                except Exception as walk_err:
-                    logger.warning(f"⚠️ No se pudo listar archivos para backup: {walk_err}")
-
-            # Crear backups (.bak) antes de modificar
-            logger.info(f"💾 Creando backups de {len(files_to_backup)} archivos...")
-            backup_count = 0
-            for file_path in files_to_backup:
-                try:
-                    bak_path = file_path + ".bak"
-                    shutil.copy2(file_path, bak_path)
-                    backup_files.append({"original": file_path, "backup": bak_path})
-                    backup_count += 1
-                except Exception as copy_err:
-                    logger.warning(f"⚠️ No se pudo hacer backup de {file_path}: {copy_err}")
-
-            logger.info(f"✅ {backup_count} archivos respaldados con .bak")
-
-            # Lanzamos subproceso usando _manager.run_once con un servicio sintetico
-            from app.models import ServiceDefinition
-            auto_fix_svc = ServiceDefinition(
-                name="autofix_agent",
-                command=uv_bin,
-                cwd=project_path,
-                env=auto_fix_env,
-                shell=False
-            )
-
-            # Puede tardar hasta 5 minutos un fix (aider + build puede ser lento)
-            result = await _manager.run_once("autofix_agent", auto_fix_svc, command_list=aider_cmd, timeout=300)
-
-            exit_code = result.get("exit_code", -1)
-            stdout_out = result.get("stdout", "") or ""
-            stderr_out = result.get("stderr", "") or ""
-
-            # ── CAPTURAR ARCHIVOS MODIFICADOS POR AIDER ───────────────────────────
-            modified_files = []
-            git_diff = ""
-            git_status = ""
+        async def run_autofix_background():
             try:
-                # Obtener lista de archivos modificados
-                status_res = subprocess.run(
-                    ["git", "status", "--short"],
-                    cwd=project_path, capture_output=True, text=True, timeout=10
-                )
-                git_status = status_res.stdout
+                import os
+                import sys
+                import subprocess
+                from pathlib import Path
 
-                # Parsear archivos modificados/agregados
-                for line in git_status.split('\n'):
-                    if line.strip():
-                        # Formato: " M path/to/file" o "A  path/to/file"
-                        parts = line.strip().split(maxsplit=1)
-                        if len(parts) == 2:
-                            status_code, file_path = parts
-                            modified_files.append({
-                                "path": file_path,
-                                "status": status_code  # M=modified, A=added, D=deleted, ??=untracked
-                            })
+                workspace_root = options.get("workspace_root")
+                if not workspace_root:
+                    workspace_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                
+                if target_file and os.path.isdir(target_file):
+                    project_path = target_file
+                elif target_file:
+                    project_path = os.path.dirname(target_file)
+                else:
+                    project_path = workspace_root
+                    
+                if not os.path.isabs(project_path):
+                    project_path = os.path.join(workspace_root, project_path)
 
-                # Obtener diff de cambios
-                if modified_files:
-                    diff_res = subprocess.run(
-                        ["git", "diff", "--no-color", "--stat"],
-                        cwd=project_path, capture_output=True, text=True, timeout=10
-                    )
-                    git_diff_stat = diff_res.stdout
+                if not os.path.isdir(project_path):
+                    project_path = workspace_root
 
-                    # Diff completo (limitado para no sobrecargar)
-                    diff_full_res = subprocess.run(
-                        ["git", "diff", "--no-color"],
-                        cwd=project_path, capture_output=True, text=True, timeout=15
-                    )
-                    git_diff = diff_full_res.stdout[:5000]  # Limitar a 5KB
+                import uuid
+                
+                branch_name = f"{branch_prefix}{uuid.uuid4().hex[:6]}"
 
-                logger.info(f"📁 Archivos modificados por Aider: {len(modified_files)}")
-                for f in modified_files[:5]:
-                    logger.info(f"   {f['status']} {f['path']}")
-                if len(modified_files) > 5:
-                    logger.info(f"   ... y {len(modified_files) - 5} más")
+                logger.info(f"🌿 Autofix: cwd={project_path} | aislando en nueva rama {branch_name}...")
+                subprocess.run(["git", "stash"], cwd=project_path, capture_output=True)
+                checkout_res = subprocess.run(["git", "checkout", "-b", branch_name], cwd=project_path, capture_output=True, text=True)
+                if checkout_res.returncode != 0 and "fatal: not a git repository" in checkout_res.stderr:
+                    logger.warning("No es un repositorio Git, ignorando comando checkout")
+                
+                uv_bin = shutil.which("uv") or r"C:\Users\Sergio\AppData\Local\Programs\Python\Python313\Scripts\uv.exe"
+                logger.info(f"🤖 uv localizado en: {uv_bin} | Ejecutando Aider...")
+                
+                aider_cmd = [uv_bin, "tool", "run", "--from", "aider-chat", "aider", "--yes", "--no-show-model-warnings", "--message", instruction]
+                
+                if target_file and os.path.isfile(target_file):
+                    aider_cmd.append(target_file)
 
-            except Exception as git_err:
-                logger.warning(f"⚠️ No se pudo capturar git diff: {git_err}")
+                # Contextual extra files (for explicit features / bugfixes)
+                for c_file in options.get("context_files", []):
+                    if c_file and os.path.isfile(c_file) and c_file != target_file:
+                        aider_cmd.append(c_file)
+                
+                auto_fix_env = os.environ.copy()
 
-            # Verificar si hay archivos modificados (ignorando .gitignore, architect.json, etc.)
-            meaningful_files = [f for f in modified_files if not f['path'].endswith(('.gitignore', 'architect.json', 'report.json'))]
+                if provider == "ollama":
+                    auto_fix_env["OLLAMA_API_BASE"] = "http://localhost:11434"
+                    auto_fix_env["OLLAMA_API_KEY"] = "sk-ollama-dummy"
+                    aider_cmd.extend(["--model", f"ollama_chat/{model}"])
+                elif provider == "anthropic":
+                    aider_cmd.extend(["--model", "anthropic/claude-3-5-sonnet"])
+                
+                backup_files = []
+                suggested_files = []
+                files_to_backup = []
 
-            # Si Aider reportó error pero hay archivos modificados, igual intentar el build
-            # A veces Aider funciona pero falla el resumen al final
-            if exit_code != 0 and not meaningful_files:
-                logger.error(f"❌ Aider falló (código={exit_code}) y no se modificaron archivos significativos")
-                logger.error(f"   STDERR: {stderr_out[:500]}")
-                logger.error(f"   STDOUT: {stdout_out[:500]}")
-                return _ok(cmd, f"Autofix falló en rama {branch_name}", {
-                    "branch": branch_name,
-                    "aider_exit_code": exit_code,
-                    "fix_validated": False,
-                    "validation_skipped": True,
-                    "error": stderr_out[:500],
-                    "modified_files": modified_files,
-                    "git_diff_stat": git_diff[:1000] if git_diff else None,
-                    "git_status": git_status[:500] if git_status else None,
-                })
+                if target_file and os.path.isfile(target_file):
+                    files_to_backup.append(target_file)
+                else:
+                    try:
+                        for root, dirs, files in os.walk(project_path):
+                            dirs[:] = [d for d in dirs if d not in ('node_modules', '.git', '__pycache__', 'venv', 'dist', 'build')]
+                            for file in files:
+                                if file.endswith(('.ts', '.tsx', '.js', '.jsx', '.py', '.rs', '.go', '.java')):
+                                    files_to_backup.append(os.path.join(root, file))
+                    except Exception as walk_err:
+                        logger.warning(f"⚠️ No se pudo listar archivos para backup: {walk_err}")
 
-            if exit_code != 0 and meaningful_files:
-                logger.warning(f"⚠️ Aider reportó error (código={exit_code}) pero modificó {len(meaningful_files)} archivos. Intentando build...")
-            else:
-                logger.info(f"✅ Aider completó el fix. Iniciando Validation Gate...")
+                logger.info(f"💾 Creando backups de {len(files_to_backup)} archivos...")
+                backup_count = 0
+                for file_path in files_to_backup:
+                    try:
+                        bak_path = file_path + ".bak"
+                        shutil.copy2(file_path, bak_path)
+                        backup_files.append({"original": file_path, "backup": bak_path})
+                        backup_count += 1
+                    except Exception as copy_err:
+                        logger.warning(f"⚠️ No se pudo hacer backup de {file_path}: {copy_err}")
 
-            # ── VALIDATION GATE ──────────────────────────────────────────────────
-            # Detectar el tipo de proyecto y elegir el comando de build correcto
-            build_cmd = None
-            build_tool = None
+                logger.info(f"✅ {backup_count} archivos respaldados con .bak")
 
-            if os.path.isfile(os.path.join(project_path, "package.json")):
-                build_tool = "nodejs"
-                # npm install por si Aider agregó dependencias nuevas
-                logger.info("📦 Node.js detectado. Ejecutando npm install...")
-                await asyncio.to_thread(
-                    subprocess.run,
-                    ["npm", "install"],
-                    cwd=project_path,
-                    capture_output=True,
-                    timeout=120,
-                    shell=True
-                )
-                build_cmd = ["npm", "run", "build"]
-
-            elif os.path.isfile(os.path.join(project_path, "Cargo.toml")):
-                build_tool = "rust"
-                build_cmd = ["cargo", "build"]
-
-            elif os.path.isfile(os.path.join(project_path, "pyproject.toml")) or \
-                 os.path.isfile(os.path.join(project_path, "setup.py")):
-                build_tool = "python"
-                build_cmd = ["python", "-m", "py_compile"]
-
-            fix_validated = False
-            build_exit_code = None
-            build_output = ""
-
-            if build_cmd:
-                logger.info(f"🔨 [{build_tool}] Ejecutando: {' '.join(build_cmd)}")
-                build_svc = ServiceDefinition(
-                    name=f"validate_{build_tool}",
-                    command=build_cmd[0],
+                from app.models import ServiceDefinition
+                auto_fix_svc = ServiceDefinition(
+                    name="autofix_agent",
+                    command=uv_bin,
                     cwd=project_path,
                     env=auto_fix_env,
-                    shell=True
+                    shell=False
                 )
-                build_result = await _manager.run_once(
-                    f"validate_{build_tool}", build_svc,
-                    command_list=build_cmd, timeout=120
-                )
-                build_exit_code = build_result.get("exit_code", -1)
-                build_output = (build_result.get("stdout") or "") + (build_result.get("stderr") or "")
 
-                if build_exit_code == 0:
-                    fix_validated = True
-                    logger.info(f"✅ Validation Gate PASÓ — Build exitoso en rama {branch_name}")
-                    # Build pasó: mantener .bak y el archivo modificado
-                    logger.info(f"💾 Backups .bak mantenidos por seguridad")
+                result = await _manager.run_once("autofix_agent", auto_fix_svc, command_list=aider_cmd, timeout=300)
+
+                exit_code = result.get("exit_code", -1)
+                stdout_out = result.get("stdout", "") or ""
+                stderr_out = result.get("stderr", "") or ""
+
+                modified_files = []
+                git_diff = ""
+                git_status = ""
+                try:
+                    status_res = subprocess.run(
+                        ["git", "status", "--short"],
+                        cwd=project_path, capture_output=True, text=True, timeout=10
+                    )
+                    git_status = status_res.stdout
+
+                    for line in git_status.split('\n'):
+                        if line.strip():
+                            parts = line.strip().split(maxsplit=1)
+                            if len(parts) == 2:
+                                status_code, file_path_res = parts
+                                modified_files.append({
+                                    "path": file_path_res,
+                                    "status": status_code
+                                })
+
+                    if modified_files:
+                        diff_res = subprocess.run(
+                            ["git", "diff", "--no-color", "--stat"],
+                            cwd=project_path, capture_output=True, text=True, timeout=10
+                        )
+                        git_diff_stat = diff_res.stdout
+
+                        diff_full_res = subprocess.run(
+                            ["git", "diff", "--no-color"],
+                            cwd=project_path, capture_output=True, text=True, timeout=15
+                        )
+                        git_diff = diff_full_res.stdout[:5000]
+
+                    logger.info(f"📁 Archivos modificados por Aider: {len(modified_files)}")
+                except Exception as git_err:
+                    logger.warning(f"⚠️ No se pudo capturar git diff: {git_err}")
+
+                meaningful_files = [f for f in modified_files if not f['path'].endswith(('.gitignore', 'architect.json', 'report.json'))]
+
+                if exit_code != 0 and not meaningful_files:
+                    logger.error(f"❌ Aider falló (código={exit_code}) y no se modificaron archivos significativos")
+                    payload = {
+                        "branch": branch_name,
+                        "aider_exit_code": exit_code,
+                        "fix_validated": False,
+                        "validation_skipped": True,
+                        "error": stderr_out[:500],
+                        "modified_files": modified_files,
+                        "git_diff_stat": git_diff[:1000] if git_diff else None,
+                        "git_status": git_status[:500] if git_status else None,
+                    }
+                    await report_to_cerebro(payload, failed=True)
+                    return
+
+                logger.info(f"✅ Aider completó el fix. Iniciando Validation Gate...")
+
+                build_cmd = None
+                build_tool = None
+
+                if os.path.isfile(os.path.join(project_path, "package.json")):
+                    build_tool = "nodejs"
+                    logger.info("📦 Node.js detectado. Ejecutando npm install...")
+                    await asyncio.to_thread(
+                        subprocess.run,
+                        ["npm", "install"],
+                        cwd=project_path,
+                        capture_output=True,
+                        timeout=120,
+                        shell=True
+                    )
+                    build_cmd = ["npm", "run", "build"]
+
+                elif os.path.isfile(os.path.join(project_path, "Cargo.toml")):
+                    build_tool = "rust"
+                    build_cmd = ["cargo", "build"]
+
+                elif os.path.isfile(os.path.join(project_path, "pyproject.toml")) or \
+                     os.path.isfile(os.path.join(project_path, "setup.py")):
+                    build_tool = "python"
+                    build_cmd = ["python", "-m", "py_compile"]
+
+                fix_validated = False
+                build_exit_code = None
+                build_output = ""
+
+                if build_cmd:
+                    logger.info(f"🔨 [{build_tool}] Ejecutando: {' '.join(build_cmd)}")
+                    build_svc = ServiceDefinition(
+                        name=f"validate_{build_tool}",
+                        command=build_cmd[0],
+                        cwd=project_path,
+                        env=auto_fix_env,
+                        shell=True
+                    )
+                    build_result = await _manager.run_once(
+                        f"validate_{build_tool}", build_svc,
+                        command_list=build_cmd, timeout=120
+                    )
+                    build_exit_code = build_result.get("exit_code", -1)
+                    build_output = (build_result.get("stdout") or "") + (build_result.get("stderr") or "")
+
+                    if build_exit_code == 0:
+                        fix_validated = True
+                        logger.info(f"✅ Validation Gate PASÓ — Build exitoso en rama {branch_name}")
+                    else:
+                        fix_validated = False
+                        logger.warning(f"⚠️ Validation Gate FALLÓ — Build roto. Fix no aplicable sin revisión.")
+                        logger.info("🔄 Restaurando archivos originales desde .bak y creando .suggested...")
+
+                        for backup_info in backup_files:
+                            original_path = backup_info["original"]
+                            bak_path = backup_info["backup"]
+                            try:
+                                if os.path.exists(original_path) and os.path.exists(bak_path):
+                                    with open(original_path, 'r', encoding='utf-8') as f:
+                                        modified_content = f.read()
+                                    with open(bak_path, 'r', encoding='utf-8') as f:
+                                        original_content = f.read()
+
+                                    if modified_content != original_content:
+                                        suggested_path = original_path + ".suggested"
+                                        with open(suggested_path, 'w', encoding='utf-8') as f:
+                                            f.write(f"# Suggested fix for: {os.path.basename(original_path)}\n")
+                                            f.write(f"# Timestamp: {datetime.now().isoformat()}\n")
+                                            f.write(f"# Branch: {branch_name}\n")
+                                            f.write(f"# Build failed with exit code: {build_exit_code}\n")
+                                            f.write(f"# --- ORIGINAL ---\n")
+                                            f.write(original_content)
+                                            f.write(f"\n# --- SUGGESTED ---\n")
+                                            f.write(modified_content)
+
+                                        suggested_files.append({
+                                            "original": original_path,
+                                            "suggested": suggested_path,
+                                            "backup": bak_path
+                                        })
+                                    shutil.copy2(bak_path, original_path)
+                                    os.remove(bak_path)
+                            except Exception as restore_err:
+                                logger.error(f"   ❌ Error restaurando {original_path}: {restore_err}")
                 else:
-                    fix_validated = False
-                    logger.warning(f"⚠️ Validation Gate FALLÓ — Build roto. Fix no aplicable sin revisión.")
-                    logger.warning(f"   Build output: {build_output[:500]}")
+                    logger.info("⚠️ No se detectó build tool conocido. Validación omitida.")
+                    fix_validated = None
 
-                    # ── MANEJO DE ARCHIVOS CUANDO BUILD FALLA ─────────────────────────
-                    logger.info("🔄 Restaurando archivos originales desde .bak y creando .suggested...")
+                payload = {
+                    "branch": branch_name,
+                    "aider_exit_code": exit_code,
+                    "fix_validated": fix_validated,
+                    "build_tool": build_tool,
+                    "build_exit_code": build_exit_code,
+                    "aider_output": stdout_out[:1000],
+                    "build_output": build_output[:1000],
+                    "modified_files": modified_files,
+                    "git_diff_stat": git_diff[:2000] if git_diff else None,
+                    "git_diff_full": git_diff[:8000] if git_diff else None,
+                    "git_status": git_status[:500] if git_status else None,
+                    "files_count": len(modified_files),
+                    "backup_count": len(backup_files),
+                    "suggested_files": suggested_files,
+                    "suggested_count": len(suggested_files),
+                }
 
-                    for backup_info in backup_files:
-                        original_path = backup_info["original"]
-                        bak_path = backup_info["backup"]
+                await report_to_cerebro(payload, failed=False)
 
-                        try:
-                            # Verificar si el archivo fue modificado
-                            if os.path.exists(original_path) and os.path.exists(bak_path):
-                                # Leer contenido original y modificado
-                                with open(original_path, 'r', encoding='utf-8') as f:
-                                    modified_content = f.read()
-                                with open(bak_path, 'r', encoding='utf-8') as f:
-                                    original_content = f.read()
+            except Exception as e:
+                logger.exception("Error en Autofix background")
+                await report_to_cerebro({"error": str(e)}, failed=True)
 
-                                # Solo si hay diferencias, crear .suggested
-                                if modified_content != original_content:
-                                    suggested_path = original_path + ".suggested"
-                                    with open(suggested_path, 'w', encoding='utf-8') as f:
-                                        f.write(f"# Suggested fix for: {os.path.basename(original_path)}\n")
-                                        f.write(f"# Timestamp: {datetime.now().isoformat()}\n")
-                                        f.write(f"# Branch: {branch_name}\n")
-                                        f.write(f"# Build failed with exit code: {build_exit_code}\n")
-                                        f.write(f"# --- ORIGINAL ---\n")
-                                        f.write(original_content)
-                                        f.write(f"\n# --- SUGGESTED ---\n")
-                                        f.write(modified_content)
+        async def report_to_cerebro(payload: dict, failed: bool):
+            cerebro_url = options.get("cerebro_url", "http://localhost:4000")
+            req_id_stripped = cmd.request_id.split("-", 1)[-1] if cmd.request_id else ""
+            event_type = f"{cmd.action}_failed" if failed else f"{cmd.action}_completed"
+            
+            payload["autofix_id"] = req_id_stripped # Por retrocompatibilidad (Dashboard usa este en vez del command ID a veces)
+            payload["request_id"] = req_id_stripped
+            payload["target"] = target_file
+            
+            try:
+                import httpx
+                async with httpx.AsyncClient() as client:
+                    await client.post(f"{cerebro_url}/api/events", json={
+                        "source": "executor",
+                        "type": event_type,
+                        "severity": "error" if failed else "info",
+                        "timestamp": datetime.now().isoformat(),
+                        "payload": payload
+                    })
+                logger.info(f"🚀 Resultado enviado a Cerebro por webhook ({event_type})")
+            except Exception as e:
+                logger.error(f"❌ Error reportando a Cerebro: {e}")
 
-                                    suggested_files.append({
-                                        "original": original_path,
-                                        "suggested": suggested_path,
-                                        "backup": bak_path
-                                    })
-                                    logger.info(f"   📝 Creado .suggested: {suggested_path}")
-
-                                # Restaurar archivo original desde .bak
-                                shutil.copy2(bak_path, original_path)
-                                logger.info(f"   ✅ Restaurado original: {original_path}")
-
-                                # Eliminar .bak (el usuario pidió que se elimine si build falla)
-                                os.remove(bak_path)
-                                logger.info(f"   🗑️ Eliminado .bak: {bak_path}")
-
-                        except Exception as restore_err:
-                            logger.error(f"   ❌ Error restaurando {original_path}: {restore_err}")
-
-            else:
-                logger.info("⚠️ No se detectó build tool conocido. Validación omitida.")
-                fix_validated = None  # None = no aplica / indeterminado
-                # Sin build tool, mantener .bak como precaución
-                logger.info(f"💾 Backups .bak mantenidos (no hay build para validar)")
-
-            return _ok(cmd, f"Autofix finalizado en rama {branch_name}", {
-                "branch": branch_name,
-                "aider_exit_code": exit_code,
-                "fix_validated": fix_validated,
-                "build_tool": build_tool,
-                "build_exit_code": build_exit_code,
-                "aider_output": stdout_out[:1000],
-                "build_output": build_output[:1000],
-                # Info detallada de archivos modificados
-                "modified_files": modified_files,
-                "git_diff_stat": git_diff[:2000] if git_diff else None,
-                "git_diff_full": git_diff[:8000] if git_diff else None,
-                "git_status": git_status[:500] if git_status else None,
-                "files_count": len(modified_files),
-                # Info de trazabilidad de backups y suggested
-                "backup_count": len(backup_files),
-                "suggested_files": suggested_files,
-                "suggested_count": len(suggested_files),
-            })
-
-        except Exception as e:
-            logger.exception("Error en Autofix")
-            return _reject(cmd, str(e))
+        # Encolar la tarea
+        background_tasks.add_task(run_autofix_background)
+        return _ok(cmd, f"{cmd.action.capitalize()} request encolado", {"status": "enqueued"})
 
     # ── desconocido ───────────────────────────────────────────────────────────
     else:
