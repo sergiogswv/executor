@@ -249,16 +249,16 @@ async def handle_command(cmd: ExecutorCommand, background_tasks: BackgroundTasks
                 workspace_root = options.get("workspace_root")
                 if not workspace_root:
                     workspace_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-                
-                if target_file and os.path.isdir(target_file):
-                    project_path = target_file
+                target_abs = target_file
+                if target_file and not os.path.isabs(target_file):
+                    target_abs = os.path.join(workspace_root, target_file)
+
+                if target_file and os.path.isdir(target_abs):
+                    project_path = target_abs
                 elif target_file:
-                    project_path = os.path.dirname(target_file)
+                    project_path = os.path.dirname(target_abs)
                 else:
                     project_path = workspace_root
-                    
-                if not os.path.isabs(project_path):
-                    project_path = os.path.join(workspace_root, project_path)
 
                 if not os.path.isdir(project_path):
                     project_path = workspace_root
@@ -278,13 +278,14 @@ async def handle_command(cmd: ExecutorCommand, background_tasks: BackgroundTasks
                 
                 aider_cmd = [uv_bin, "tool", "run", "--from", "aider-chat", "aider", "--yes", "--no-show-model-warnings", "--message", instruction]
                 
-                if target_file and os.path.isfile(target_file):
-                    aider_cmd.append(target_file)
+                if target_file and os.path.isfile(target_abs):
+                    aider_cmd.append(target_abs)
 
                 # Contextual extra files (for explicit features / bugfixes)
                 for c_file in options.get("context_files", []):
-                    if c_file and os.path.isfile(c_file) and c_file != target_file:
-                        aider_cmd.append(c_file)
+                    c_abs = c_file if os.path.isabs(c_file) else os.path.join(workspace_root, c_file)
+                    if c_abs and os.path.isfile(c_abs) and c_abs != target_abs:
+                        aider_cmd.append(c_abs)
                 
                 auto_fix_env = os.environ.copy()
 
@@ -299,18 +300,14 @@ async def handle_command(cmd: ExecutorCommand, background_tasks: BackgroundTasks
                 suggested_files = []
                 files_to_backup = []
 
-                if target_file and os.path.isfile(target_file):
-                    files_to_backup.append(target_file)
+                if target_file and os.path.isfile(target_abs):
+                    files_to_backup.append(target_abs)
                 else:
-                    try:
-                        for root, dirs, files in os.walk(project_path):
-                            dirs[:] = [d for d in dirs if d not in ('node_modules', '.git', '__pycache__', 'venv', 'dist', 'build')]
-                            for file in files:
-                                if file.endswith(('.ts', '.tsx', '.js', '.jsx', '.py', '.rs', '.go', '.java')):
-                                    files_to_backup.append(os.path.join(root, file))
-                    except Exception as walk_err:
-                        logger.warning(f"⚠️ No se pudo listar archivos para backup: {walk_err}")
-
+                    # Al ser un directory/proyecto completo, solo respaldar context_files explicitos para evitar miles de archivos lentos
+                    for c_file in options.get("context_files", []):
+                        c_abs = c_file if os.path.isabs(c_file) else os.path.join(workspace_root, c_file)
+                        if os.path.isfile(c_abs):
+                            files_to_backup.append(c_abs)
                 logger.info(f"💾 Creando backups de {len(files_to_backup)} archivos...")
                 backup_count = 0
                 for file_path in files_to_backup:
