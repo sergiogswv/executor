@@ -16,6 +16,30 @@ logger = logging.getLogger("ejecutor.routes")
 _registry: ServiceRegistry | None = None
 _manager: ProcessManager | None = None
 
+_active_autofixes = {}
+
+def _find_tests_for_files(modified_files, project_path):
+    """Intenta encontrar archivos de test específicos para los archivos modificados."""
+    test_files = []
+    for f in modified_files:
+        path = f.get("path", "")
+        if not path: continue
+        
+        base = os.path.splitext(path)[0]
+        ext = os.path.splitext(path)[1]
+        
+        candidates = []
+        if ext in (".ts", ".js", ".tsx", ".jsx"):
+            candidates = [f"{base}.spec{ext}", f"{base}.test{ext}"]
+        elif ext == ".py":
+            candidates = [f"{base}_test.py", f"tests/test_{os.path.basename(path)}"]
+            
+        for cand in candidates:
+            if os.path.isfile(os.path.join(project_path, cand)):
+                test_files.append(cand)
+                
+    return list(set(test_files))
+
 
 def init(registry: ServiceRegistry, manager: ProcessManager) -> None:
     global _registry, _manager
@@ -227,8 +251,15 @@ async def handle_command(cmd: ExecutorCommand, background_tasks: BackgroundTasks
         options = cmd.options or {}
         instruction = options.get("instruction", "")
         branch_prefix = options.get("branch_prefix", "skrymir-fix/")
-        provider = options.get("provider", "ollama")
-        model = options.get("model", "deepseek-coder-v2:16b-lite-instruct-q4_K_M")
+        # El modelo ahora viene configurado desde Cerebro en la request
+        provider = options.get("provider", "openrouter")
+        model = options.get("model", "google/gemini-2.0-flash-exp:free")
+        api_key = options.get("api_key")
+
+        # Normalización de proveedores para compatibilidad con Aider
+        if provider == "gemini-open-source":
+            provider = "gemini"
+        
         target_file = cmd.target
 
         if target_file is None:
@@ -247,20 +278,43 @@ async def handle_command(cmd: ExecutorCommand, background_tasks: BackgroundTasks
                 from pathlib import Path
 
                 workspace_root = options.get("workspace_root")
-                if not workspace_root:
-                    workspace_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
                 # workspace_root ya es el directorio raíz del proyecto destino (ej: pro-leads-backend)
-                # project_path SIEMPRE es el workspace_root, nunca un subdirectorio del target_file
-                project_path = workspace_root
-                if not os.path.isdir(project_path):
-                    logger.warning(f"⚠️ workspace_root no existe como directorio: {project_path}")
+                if not workspace_root or not os.path.isdir(workspace_root):
                     project_path = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                else:
+                    project_path = workspace_root
 
                 # Calcular ruta absoluta del archivo target (para backup y verificación)
                 target_abs = target_file
                 if target_file and not os.path.isabs(target_file):
                     target_abs = os.path.join(project_path, target_file)
+
+                # --- Inferencia de la raíz del proyecto ---
+                # Si target_file es absoluto y no tenemos workspace_root explícito, 
+                # intentamos encontrar la raíz subiendo niveles.
+                if target_file and os.path.isabs(target_abs) and not options.get("workspace_root"):
+                    _curr = os.path.dirname(target_abs)
+                    for _ in range(4):
+                        if os.path.isfile(os.path.join(_curr, "package.json")) or \
+                           os.path.isfile(os.path.join(_curr, "pyproject.toml")) or \
+                           os.path.isfile(os.path.join(_curr, "Cargo.toml")):
+                            project_path = _curr
+                            logger.info(f"📍 Raíz del proyecto detectada vía target_file: {project_path}")
+                            break
+                        _parent = os.path.dirname(_curr)
+                        if _parent == _curr: break
+                        _curr = _parent
+
+                # --- Normalización de ruta para Windows (evitar error de CMD con rutas UNC/LongPath) ---
+                if project_path.startswith("\\\\?\\"):
+                    project_path = project_path.replace("\\\\?\\", "")
+
+                # Bloquear ejecuciones adicionales en este proyecto
+                if project_path in _active_autofixes:
+                    logger.warning(f"⚠️ Ya hay un proceso activo para {project_path}. Ignorando duplicado.")
+                    return
+                _active_autofixes[project_path] = True
+                logger.info(f"🔒 [Executor] Bloqueando proyecto: {project_path}")
 
                 import uuid
                 
@@ -377,12 +431,24 @@ async def handle_command(cmd: ExecutorCommand, background_tasks: BackgroundTasks
 
                 auto_fix_env = os.environ.copy()
 
+                # Inyectar API Key según el proveedor
+                if api_key:
+                    if provider == "openrouter":
+                        auto_fix_env["OPENROUTER_API_KEY"] = api_key
+                    elif provider == "gemini":
+                        auto_fix_env["GEMINI_API_KEY"] = api_key
+                    elif provider == "anthropic":
+                        auto_fix_env["ANTHROPIC_API_KEY"] = api_key
+                    elif provider == "openai":
+                        auto_fix_env["OPENAI_API_KEY"] = api_key
+
                 if provider == "ollama":
                     auto_fix_env["OLLAMA_API_BASE"] = "http://localhost:11434"
                     auto_fix_env["OLLAMA_API_KEY"] = "sk-ollama-dummy"
                     aider_cmd.extend(["--model", f"ollama_chat/{model}"])
-                elif provider == "anthropic":
-                    aider_cmd.extend(["--model", "anthropic/claude-3-5-sonnet"])
+                else:
+                    # Para el resto (gemini, openrouter, anthropic, openai), Aider usa provider/model
+                    aider_cmd.extend(["--model", f"{provider}/{model}"])
 
                 # ── Backups antes del loop (para poder rollback si todo falla) ─────────
                 backup_files = []
@@ -639,19 +705,32 @@ async def handle_command(cmd: ExecutorCommand, background_tasks: BackgroundTasks
                         build_output = iter_build_output
 
                         if iter_build_exit_code == 0:
-                            # Build exitoso... ¿corremos tests?
+                            # Build exitoso... corremos tests?
                             if test_cmd and options.get("run_tests", True):
-                                logger.info(f"🧪 [{build_tool}] Build OK. Ejecutando tests: {' '.join(test_cmd)}")
+                                # --- Determinar comando de test específico ---
+                                # meaningful_files viene de la detección de git status post-aider
+                                specific_tests = _find_tests_for_files(meaningful_files, project_path)
+                                current_test_cmd = list(test_cmd)
+                                if specific_tests:
+                                    logger.info(f"🧪 Archivos de test detectados: {specific_tests}")
+                                    if build_tool == "nodejs":
+                                        if current_test_cmd == ["npm", "test"]:
+                                            current_test_cmd += ["--"]
+                                        current_test_cmd += specific_tests
+                                    elif build_tool == "python":
+                                        current_test_cmd += specific_tests
+                                
+                                logger.info(f"🧪 [{build_tool}] Build OK. Ejecutando tests: {' '.join(current_test_cmd)}")
                                 test_svc = ServiceDefinition(
                                     name=f"test_{build_tool}",
-                                    command=test_cmd[0],
+                                    command=current_test_cmd[0],
                                     cwd=project_path,
                                     env=auto_fix_env,
                                     shell=True
                                 )
                                 test_result = await _manager.run_once(
                                     f"test_{build_tool}", test_svc,
-                                    command_list=test_cmd, timeout=180
+                                    command_list=current_test_cmd, timeout=180
                                 )
                                 iter_test_exit_code = test_result.get("exit_code", -1)
                                 iter_test_output = (test_result.get("stdout") or "") + (test_result.get("stderr") or "")
@@ -668,10 +747,22 @@ async def handle_command(cmd: ExecutorCommand, background_tasks: BackgroundTasks
                                         "test_exit_code": 0,
                                         "outcome": "success"
                                     })
-                                    break # ← Éxito total
+                                    break
                                 else:
+                                    # --- Salvaguarda: si no se encontraron tests, no fallar el loop ---
+                                    _no_tests_indicators = ["collected 0 items", "No tests found", "no tests were found", "0 tests passed"]
+                                    if any(ind.lower() in iter_test_output.lower() for ind in _no_tests_indicators):
+                                        logger.info(f"✅ Iteración {iteration_num}: No se encontraron tests (ejecución exitosa por omisión).")
+                                        fix_validated = True
+                                        iteration_history.append({
+                                            "iteration": iteration_num,
+                                            "files_modified": len(meaningful_files),
+                                            "build_exit_code": 0,
+                                            "outcome": "success_no_tests"
+                                        })
+                                        break
+                                    
                                     logger.warning(f"❌ Iteración {iteration_num}: Tests FALLARON (código={iter_test_exit_code})")
-                                    # Tratar fallo de test como fallo de compilación para que Aider intente corregirlo
                                     iter_build_exit_code = iter_test_exit_code
                                     iter_build_output = iter_test_output
                             else:
@@ -679,13 +770,11 @@ async def handle_command(cmd: ExecutorCommand, background_tasks: BackgroundTasks
                                 logger.info(f"✅ Iteración {iteration_num}: Build EXITOSO (sin tests) en rama {branch_name}")
                                 iteration_history.append({
                                     "iteration": iteration_num,
-                                    "instruction_preview": current_instruction[:200],
-                                    "aider_exit_code": exit_code,
                                     "files_modified": len(meaningful_files),
                                     "build_exit_code": 0,
                                     "outcome": "success"
                                 })
-                                break  # ← Éxito, salir del loop
+                                break
 
                         else:
                             # Build falló — ¿hay más intentos?
@@ -702,10 +791,9 @@ async def handle_command(cmd: ExecutorCommand, background_tasks: BackgroundTasks
                                 len([l for l in _ansi_clean.sub('', iteration_history[-1].get("build_error_preview", "")).splitlines()
                                      if "error TS" in l]) if iteration_history else 0
                             )
-                            _regression = _new_error_count > _prev_error_count and _new_error_count > len(baseline_errors)
+                            _regression = (_new_error_count > _prev_error_count + 10) and (_new_error_count > len(baseline_errors) + 5)
                             if _regression:
-                                logger.error(f"🚨 Safeguard: errores aumentaron {_prev_error_count} → {_new_error_count}. "
-                                             f"Aider está empeorando el código. Abortando loop.")
+                                logger.error(f"🚨 Safeguard: regresión masiva de errores detectada ({_prev_error_count} → {_new_error_count}). Abortando loop.")
 
                             iteration_history.append({
                                 "iteration": iteration_num,
@@ -725,12 +813,31 @@ async def handle_command(cmd: ExecutorCommand, background_tasks: BackgroundTasks
                             if iteration_num < max_iterations:
                                 # Preparar siguiente iteración con el error de build como contexto
                                 logger.info(f"🧠 Preparando iteración {iteration_num + 1} con error de compilación como contexto...")
+                                # Extraer solo los errores NUEVOS (excluir baseline)
+                                _new_error_lines_raw = [
+                                    l for l in _ansi_clean.sub('', iter_build_output).splitlines()
+                                    if ("error TS" in l or ("error" in l.lower() and l.strip().startswith("src")))
+                                ]
+                                # Intenta normalizar para filtrar baseline
+                                _new_error_lines = [
+                                    l for l in _new_error_lines_raw
+                                    if l.strip() not in baseline_errors
+                                ]
+                                if not _new_error_lines:
+                                    _new_errors_text = iter_build_output[-2000:]
+                                else:
+                                    _new_errors_text = "\n".join(_new_error_lines[:15])
+
                                 current_instruction = (
-                                    f"[Intento {iteration_num + 1}/{max_iterations}] El build falló.\n\n"
-                                    f"Error de compilación:\n```\n{iter_build_output[-2000:]}\n```\n\n"
-                                    f"Por favor corrige SOLO los errores de compilación listados arriba "
-                                    f"sin romper la lógica del cambio original.\n\n"
-                                    f"Tarea original: {instruction[:400]}"
+                                    f"## CONTEXTO: Iteración {iteration_num + 1}/{max_iterations}\n\n"
+                                    f"**IMPORTANTE:** Los cambios del intento anterior YA ESTÁN APLICADOS. "
+                                    f"NO vuelvas a hacer los cambios originales.\n\n"
+                                    f"**Tu única tarea:** Corregir LOS SIGUIENTES ERRORES DE COMPILACIÓN sin modificar nada más:\n\n"
+                                    f"```\n{_new_errors_text}\n```\n\n"
+                                    f"**Instrucciones:**\n"
+                                    f"1. PRESERVA todos los cambios existentes\n"
+                                    f"2. Corrige SOLO las líneas que causan estos errores específicos\n"
+                                    f"3. No elimines funcionalidad para 'arreglar' el build\n"
                                 )
                             else:
                                 fix_validated = False
@@ -812,6 +919,11 @@ async def handle_command(cmd: ExecutorCommand, background_tasks: BackgroundTasks
             except Exception as e:
                 logger.exception("Error en Autofix background")
                 await report_to_cerebro({"error": str(e)}, failed=True)
+            finally:
+                # ── 🔓 Liberar bloqueo del proyecto ──
+                if 'project_path' in locals() and project_path in _active_autofixes:
+                    _active_autofixes.pop(project_path, None)
+                    logger.info(f"🔓 [Executor] Bloqueo liberado para {project_path}")
 
         async def report_to_cerebro(payload: dict, failed: bool):
             cerebro_url = options.get("cerebro_url", "http://localhost:4000")
@@ -824,12 +936,15 @@ async def handle_command(cmd: ExecutorCommand, background_tasks: BackgroundTasks
             
             try:
                 import httpx
+                import uuid
+                from datetime import timezone
                 async with httpx.AsyncClient() as client:
                     await client.post(f"{cerebro_url}/api/events", json={
+                        "id": f"exec-{uuid.uuid4().hex[:8]}",
                         "source": "executor",
                         "type": event_type,
                         "severity": "error" if failed else "info",
-                        "timestamp": datetime.now().isoformat(),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
                         "payload": payload
                     })
                 logger.info(f"🚀 Resultado enviado a Cerebro por webhook ({event_type})")

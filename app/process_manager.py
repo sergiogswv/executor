@@ -303,8 +303,8 @@ class ProcessManager:
 
             return {
                 "exit_code": proc.returncode,
-                "stdout": proc.stdout[-1000:] if proc.stdout else "", # Últimos 1000 chars
-                "stderr": proc.stderr[-1000:] if proc.stderr else "",
+                "stdout": proc.stdout[-10000:] if proc.stdout else "", # Últimos 10000 chars (antes 1000)
+                "stderr": proc.stderr[-10000:] if proc.stderr else "",
                 "status": "completed" if proc.returncode == 0 else "failed"
             }
         except subprocess.TimeoutExpired as te:
@@ -312,8 +312,8 @@ class ProcessManager:
             return {
                 "exit_code": -1,
                 "error": f"Timeout agotado ({timeout}s)",
-                "stdout": te.stdout[-500:] if te.stdout else "",
-                "stderr": te.stderr[-500:] if te.stderr else "",
+                "stdout": te.stdout[-5000:] if te.stdout else "", # Antes 500
+                "stderr": te.stderr[-5000:] if te.stderr else "",
                 "status": "timeout"
             }
         except Exception as e:
