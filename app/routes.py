@@ -16,7 +16,7 @@ logger = logging.getLogger("ejecutor.routes")
 _registry: ServiceRegistry | None = None
 _manager: ProcessManager | None = None
 
-_active_autofixes = {}
+_active_autofixes: dict = {}  # { project_path: timestamp_float }
 
 def _find_tests_for_files(modified_files, project_path):
     """Intenta encontrar archivos de test específicos para los archivos modificados."""
@@ -45,6 +45,34 @@ def init(registry: ServiceRegistry, manager: ProcessManager) -> None:
     global _registry, _manager
     _registry = registry
     _manager = manager
+
+
+# ─── GET /heartbeat — Estado del Executor ────────────────────────────────────
+@router.get("/heartbeat", response_model=ApiResponse)
+async def heartbeat():
+    """
+    TASK-03: Permite a Cerebro verificar que el Executor sigue vivo.
+    Devuelve la lista de proyectos con autofix activo y cunto tiempo llevan.
+    """
+    import time
+    now = time.time()
+    active = [
+        {
+            "project_path": k,
+            "elapsed_seconds": round(now - v) if isinstance(v, float) else -1,
+        }
+        for k, v in _active_autofixes.items()
+    ]
+    return ApiResponse(
+        ok=True,
+        message="Executor vivo",
+        data={
+            "alive": True,
+            "active_autofixes": active,
+            "active_count": len(active),
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+    )
 
 
 # ─── POST /command — Recibir instrucción del Cerebro ─────────────────────────
@@ -252,8 +280,8 @@ async def handle_command(cmd: ExecutorCommand, background_tasks: BackgroundTasks
         instruction = options.get("instruction", "")
         branch_prefix = options.get("branch_prefix", "skrymir-fix/")
         # El modelo ahora viene configurado desde Cerebro en la request
-        provider = options.get("provider", "openrouter")
-        model = options.get("model", "google/gemini-2.0-flash-exp:free")
+        provider = options.get("provider", "ollama")
+        model = options.get("model", "llama3.2")
         api_key = options.get("api_key")
 
         # Normalización de proveedores para compatibilidad con Aider
@@ -313,7 +341,8 @@ async def handle_command(cmd: ExecutorCommand, background_tasks: BackgroundTasks
                 if project_path in _active_autofixes:
                     logger.warning(f"⚠️ Ya hay un proceso activo para {project_path}. Ignorando duplicado.")
                     return
-                _active_autofixes[project_path] = True
+                import time as _time_module
+                _active_autofixes[project_path] = _time_module.time()  # Guardar timestamp
                 logger.info(f"🔒 [Executor] Bloqueando proyecto: {project_path}")
 
                 import uuid
@@ -321,10 +350,14 @@ async def handle_command(cmd: ExecutorCommand, background_tasks: BackgroundTasks
                 branch_name = f"{branch_prefix}{uuid.uuid4().hex[:6]}"
 
                 logger.info(f"🌿 Autofix: cwd={project_path} | target={target_file or '(sin archivo)'} | rama {branch_name}...")
+                subprocess.run(["git", "init"], cwd=project_path, capture_output=True) # Asegurar repo para Aider
                 subprocess.run(["git", "stash"], cwd=project_path, capture_output=True)
                 checkout_res = subprocess.run(["git", "checkout", "-b", branch_name], cwd=project_path, capture_output=True, text=True)
                 if checkout_res.returncode != 0 and "fatal: not a git repository" in checkout_res.stderr:
-                    logger.warning("No es un repositorio Git, ignorando comando checkout")
+                    logger.warning("No es un repositorio Git, intentando crear commit inicial...")
+                    subprocess.run(["git", "add", "."], cwd=project_path)
+                    subprocess.run(["git", "commit", "-m", "initial commit"], cwd=project_path)
+                    subprocess.run(["git", "checkout", "-b", branch_name], cwd=project_path)
                 
                 uv_bin = shutil.which("uv") or r"C:\Users\Sergio\AppData\Local\Programs\Python\Python313\Scripts\uv.exe"
                 logger.info(f"🤖 uv localizado en: {uv_bin} | Ejecutando Aider...")
@@ -385,6 +418,7 @@ async def handle_command(cmd: ExecutorCommand, background_tasks: BackgroundTasks
 
                 aider_cmd = [uv_bin, "tool", "run", "--from", "aider-chat", "aider",
                              "--yes", "--no-show-model-warnings", "--no-auto-commits", "--no-pretty",
+                             "--no-browser", "--no-suggest-shell-commands",
                              "--message", _aider_instruction]
 
 
@@ -437,6 +471,7 @@ async def handle_command(cmd: ExecutorCommand, background_tasks: BackgroundTasks
                         auto_fix_env["OPENROUTER_API_KEY"] = api_key
                     elif provider == "gemini":
                         auto_fix_env["GEMINI_API_KEY"] = api_key
+                        auto_fix_env["GOOGLE_API_KEY"] = api_key  # Backup para versiones de Aider que usen este nombre
                     elif provider == "anthropic":
                         auto_fix_env["ANTHROPIC_API_KEY"] = api_key
                     elif provider == "openai":
@@ -497,6 +532,42 @@ async def handle_command(cmd: ExecutorCommand, background_tasks: BackgroundTasks
 
                 if isinstance(build_cmd, str): build_cmd = build_cmd.split()
                 if isinstance(test_cmd, str): test_cmd = test_cmd.split()
+
+                # ── Intentar detectar comando de arranque (Runtime) ───────────────────
+                dev_command = options.get("dev_command")
+                if not dev_command:
+                    if build_tool == "nodejs":
+                        try:
+                            import json
+                            with open(os.path.join(project_path, "package.json"), "r") as f:
+                                pj = json.load(f)
+                                scripts = pj.get("scripts", {})
+                                # Orden de prioridad para Node/Frameworks
+                                if "start:dev" in scripts: dev_command = ["npm", "run", "start:dev"]
+                                elif "dev" in scripts: dev_command = ["npm", "run", "dev"]
+                                elif "serve" in scripts: dev_command = ["npm", "run", "serve"]
+                                elif "start" in scripts: dev_command = ["npm", "start"]
+                                else: dev_command = ["npm", "run", "dev"]
+                        except:
+                            dev_command = ["npm", "run", "dev"]
+
+                    elif build_tool == "rust":
+                        dev_command = ["cargo", "run"]
+                    elif build_tool == "python":
+                        if os.path.isfile(os.path.join(project_path, "main.py")): dev_command = ["python", "main.py"]
+                        elif os.path.isfile(os.path.join(project_path, "app.py")): dev_command = ["python", "app.py"]
+                        elif os.path.isfile(os.path.join(project_path, "manage.py")): dev_command = ["python", "manage.py", "runserver"] # Django
+                        else: dev_command = None
+                    elif os.path.isfile(os.path.join(project_path, "go.mod")):
+                        build_tool = "go"
+                        if not build_cmd: build_cmd = ["go", "build", "."]
+                        dev_command = ["go", "run", "."]
+                    else:
+                        dev_command = None
+
+                
+                if isinstance(dev_command, str): dev_command = dev_command.split()
+
 
                 # ── Pre-check: build ANTES de Aider para obtener línea base de errores ──
                 # Así solo pasamos a Aider los errores NUEVOS que él introdujo,
@@ -628,7 +699,51 @@ async def handle_command(cmd: ExecutorCommand, background_tasks: BackgroundTasks
                                 pass
                             modified_files = [f for f in modified_files if f["path"] != mf_path]
 
+                    # ── Redetección de Build Tool (Para inicialización de proyectos) ──
+                    if not build_tool:
+                        if os.path.isfile(os.path.join(project_path, "package.json")):
+                            build_tool = "nodejs"
+                            if not build_cmd: build_cmd = ["npm", "run", "build"]
+                            if not test_cmd: test_cmd = ["npm", "test"]
+                            if not dev_command:
+                                try:
+                                    import json
+                                    with open(os.path.join(project_path, "package.json"), "r") as f:
+                                        pj = json.load(f)
+                                        scripts = pj.get("scripts", {})
+                                        if "start:dev" in scripts: dev_command = ["npm", "run", "start:dev"]
+                                        elif "dev" in scripts: dev_command = ["npm", "run", "dev"]
+                                        elif "serve" in scripts: dev_command = ["npm", "run", "serve"]
+                                        elif "start" in scripts: dev_command = ["npm", "start"]
+                                        else: dev_command = ["npm", "run", "dev"]
+                                except:
+                                    dev_command = ["npm", "run", "dev"]
+
+                        elif os.path.isfile(os.path.join(project_path, "Cargo.toml")):
+                            build_tool = "rust"
+                            if not build_cmd: build_cmd = ["cargo", "build"]
+                            if not test_cmd: test_cmd = ["cargo", "test"]
+                            if not dev_command: dev_command = ["cargo", "run"]
+                        elif os.path.isfile(os.path.join(project_path, "go.mod")):
+                            build_tool = "go"
+                            if not build_cmd: build_cmd = ["go", "build", "."]
+                            if not dev_command: dev_command = ["go", "run", "."]
+                        elif any(os.path.exists(os.path.join(project_path, f)) for f in ["requirements.txt", "pyproject.toml", "main.py"]):
+                            build_tool = "python"
+                            if not build_cmd: build_cmd = ["python", "-m", "py_compile"]
+                            if not dev_command:
+                                if os.path.isfile(os.path.join(project_path, "main.py")): dev_command = ["python", "main.py"]
+                                elif os.path.isfile(os.path.join(project_path, "app.py")): dev_command = ["python", "app.py"]
+                                elif os.path.isfile(os.path.join(project_path, "manage.py")): dev_command = ["python", "manage.py", "runserver"]
+
+                        
+                        if build_tool:
+                            logger.info(f"✨ Build tool detectado tras Aider: {build_tool}")
+                            if isinstance(build_cmd, str): build_cmd = build_cmd.split()
+                            if isinstance(dev_command, str): dev_command = dev_command.split()
+
                     # ── Safeguard 2: Detectar corrupción de archivos con backup ───────
+
                     # Si uno de los archivos respaldados fue reducido a < 3 líneas o < 30 chars
                     # algo fue muy mal — restaurar y abortar.
                     _corruption_detected = False
@@ -706,16 +821,77 @@ async def handle_command(cmd: ExecutorCommand, background_tasks: BackgroundTasks
 
                         if iter_build_exit_code == 0:
                             logger.info(f"✅ [{build_tool}] Build EXITOSO")
-                            fix_validated = True
-                            iteration_history.append({
-                                "iteration": iteration_num,
-                                "instruction_preview": current_instruction[:200],
-                                "aider_exit_code": exit_code,
-                                "files_modified": len(meaningful_files),
-                                "build_exit_code": 0,
-                                "outcome": "success"
-                            })
-                            break
+
+                            # ── Runtime Validation Gate (Opcional pero recomendado para init) ──
+                            # Solo si dev_command existe y require_run es True (por defecto True en features/init)
+                            if dev_command and options.get("require_run", True):
+                                logger.info(f"🚀 Validando Runtime: {' '.join(dev_command)}...")
+                                try:
+                                    runtime_svc = ServiceDefinition(
+                                        name="runtime_validation",
+                                        command=" ".join(dev_command),
+                                        cwd=project_path,
+                                        env=auto_fix_env,
+                                        shell=True
+                                    )
+                                    # Abrir servicio en background
+                                    runtime_info = await _manager.open("runtime_validation", runtime_svc)
+                                    tid = runtime_info.terminal_id
+                                    
+                                    # Esperar a que el proceso se estabilice o falle
+                                    await asyncio.sleep(8)
+                                    
+                                    # Verificar salud
+                                    status_info = _manager.status(tid)
+                                    if not status_info or status_info.status != "running":
+                                        logger.error(f"❌ Runtime Validation FALLÓ para {' '.join(dev_command)}")
+                                        
+                                        # Capturar logs de error
+                                        err_log = ""
+                                        try:
+                                            log_path = os.path.join("logs", f"{tid}.stderr.log")
+                                            if os.path.exists(log_path):
+                                                with open(log_path, "r", encoding='utf-8', errors='ignore') as f:
+                                                    err_log = f.read()[-2000:]
+                                        except: pass
+                                        
+                                        # Simular fallo de build para disparar retry en Aider
+                                        iter_build_exit_code = 1
+                                        iter_build_output = f"EL SERVICIO FALLÓ AL ARRANCAR (RUNTIME ERROR):\n{err_log}"
+                                        build_exit_code = 1
+                                        build_output = iter_build_output
+                                        
+                                        # No hacemos break, dejamos que la lógica de reintento de abajo lo maneje
+                                    else:
+                                        logger.info("✅ Runtime Validation EXITOSA (Servicio estable durante 8s)")
+                                        await _manager.close(tid) # Matar para terminar la validación
+                                        fix_validated = True
+                                        iteration_history.append({
+                                            "iteration": iteration_num,
+                                            "instruction_preview": current_instruction[:200],
+                                            "aider_exit_code": exit_code,
+                                            "files_modified": len(meaningful_files),
+                                            "build_exit_code": 0,
+                                            "outcome": "success"
+                                        })
+                                        break
+                                except Exception as runtime_exc:
+                                    logger.error(f"⚠️ Error en runtime validation: {runtime_exc}")
+                                    # Fallback: dar por bueno el build si falló el validador mismo
+                                    fix_validated = True
+                                    break
+                            else:
+                                fix_validated = True
+                                iteration_history.append({
+                                    "iteration": iteration_num,
+                                    "instruction_preview": current_instruction[:200],
+                                    "aider_exit_code": exit_code,
+                                    "files_modified": len(meaningful_files),
+                                    "build_exit_code": 0,
+                                    "outcome": "success"
+                                })
+                                break
+
 
                         else:
                             # Build falló — ¿hay más intentos?
@@ -797,7 +973,22 @@ async def handle_command(cmd: ExecutorCommand, background_tasks: BackgroundTasks
                         })
                         break  # Sin validación, aceptar el cambio tal cual
 
-                # ── Fin del loop — Rollback si fue necesario ──────────────────────────
+                # ── Fin del loop — Rollback si fue necesario ──────────
+                if fix_validated:
+                    # Point 2: Auto-Commit if success and git repo
+                    is_git = os.path.isdir(os.path.join(project_path, ".git"))
+                    if is_git:
+                        logger.info("📝 Git detectado, realizando auto-commit...")
+                        commit_msg = f"Skrymir: {cmd.action} completed - {instruction[:50]}..."
+                        subprocess.run(["git", "add", "."], cwd=project_path)
+                        commit_res = subprocess.run(["git", "commit", "-m", commit_msg], cwd=project_path, capture_output=True, text=True)
+                        if commit_res.returncode == 0:
+                            logger.info(f"✅ Commit realizado: {commit_msg}")
+                        else:
+                            logger.warning(f"⚠️ Commit falló (posiblemente nada que commitear): {commit_res.stderr.strip()}")
+                    else:
+                        logger.info("ℹ️ No es un repositorio Git, se mantienen los cambios sin commit.")
+
                 if fix_validated is False:
                     logger.info("🔄 Restaurando archivos originales desde .bak y creando .suggested...")
                     for backup_info in backup_files:

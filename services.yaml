@@ -101,3 +101,14 @@ services:
       VIRTUAL_ENV: "../sentinel/.venv"
       PATH: "../sentinel/.venv/Scripts"
       PYTHONIOENCODING: "utf-8"
+
+  notifier:
+    name: "Telegram Notifier — Agente de Alertas"
+    command: "python -m uvicorn main:app --host 0.0.0.0 --port 4100"
+    cwd: "../notifier"
+    port: 4100
+    shell: true
+    env:
+      PYTHONIOENCODING: "utf-8"
+      VIRTUAL_ENV: "../notifier/.venv"
+      PATH: "../notifier/.venv/Scripts"
