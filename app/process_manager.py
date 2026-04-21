@@ -257,82 +257,137 @@ class ProcessManager:
 
         return info
 
-    async def run_once(self, service_key: str, service: ServiceDefinition, command_list: list[str] = None, timeout: int = 60) -> dict:
+    async def run_once(self, service_key: str, service: ServiceDefinition, command_list: list[str] = None, timeout: int = 120, report_to_cerebro: bool = True) -> dict:
         """
-        Ejecuta un comando de una sola vez y espera a que termine.
-        Retorna un dict con el status, exit_code y salida resumida.
-
-        Args:
-            timeout: Tiempo máximo en segundos (default: 60, aumentar para análisis pesados)
+        Ejecuta un comando de una sola vez y streamea la salida en tiempo real.
         """
-        import subprocess
         import platform
         from pathlib import Path
+        import asyncio
+        import httpx
+        from app.config import get_settings
 
+        settings = get_settings()
         env = os.environ.copy()
         env.update(service.env)
-        # Normalizar environment para multiplataforma
         env = _normalize_env(env, service.cwd)
 
-        # Normalizar comando para multiplataforma (solo si no se proporcionó command_list)
+        # Preparar comando
         if command_list is None:
             command = _normalize_command(service.command, service.cwd, service.shell)
-            cmd = command.split()
+            cmd_args = command.split()
         else:
-            # Aplicar normalización al primer elemento (binario) para Windows
-            cmd = command_list.copy()
-            if cmd and platform.system() == "Windows":
-                bin_path = Path(service.cwd) / cmd[0].replace("/", "\\")
-                if not Path(cmd[0]).is_absolute() and bin_path.exists():
-                    cmd[0] = str(bin_path)
-                elif not Path(cmd[0]).is_absolute():
-                    bin_path_exe = Path(service.cwd) / (cmd[0] + ".exe")
+            cmd_args = command_list.copy()
+            if cmd_args and platform.system() == "Windows":
+                bin_path = Path(service.cwd) / cmd_args[0].replace("/", "\\")
+                if not Path(cmd_args[0]).is_absolute() and bin_path.exists():
+                    cmd_args[0] = str(bin_path)
+                elif not Path(cmd_args[0]).is_absolute():
+                    bin_path_exe = Path(service.cwd) / (cmd_args[0] + ".exe")
                     if bin_path_exe.exists():
-                        cmd[0] = str(bin_path_exe)
+                        cmd_args[0] = str(bin_path_exe)
 
-        logger.info(f"🏃 Ejecución one-shot en {service.cwd}: {cmd}")
+        logger.info(f"🏃 Ejecución asíncrona one-shot en {service.cwd}: {cmd_args}")
+
+        log_buffer = []
+        last_report_time = asyncio.get_event_loop().time()
+
+        async def flush_logs():
+            """Envía el búfer acumulado a Cerebro."""
+            nonlocal log_buffer, last_report_time
+            if not log_buffer: return
+            
+            combined_msg = "\n".join(log_buffer)
+            log_buffer = []
+            last_report_time = asyncio.get_event_loop().time()
+            
+            try:
+                async with httpx.AsyncClient() as client:
+                    await client.post(f"{settings.cerebro_url}/api/events", json={
+                        "source": "executor",
+                        "type": "executor_log",
+                        "severity": "info",
+                        "payload": {
+                            "message": combined_msg,
+                            "service": service_key,
+                            "is_milestone": any(kw in combined_msg for kw in ["Successful", "Commit", "Fixed", "Applied"])
+                        }
+                    }, timeout=1.5)
+            except: pass
+
+        async def send_log_event(msg: str):
+            """Helper para acumular y reportar progreso de forma muy agrupada."""
+            if not report_to_cerebro: return
+            cleaned = msg.strip()
+            if not cleaned or len(cleaned) < 2: return
+            
+            # Filtrar ruido de barras de progreso o caracteres de escape de terminal
+            if any(x in cleaned for x in ["\b", "\r", "]]>"]): return
+            
+            log_buffer.append(cleaned)
+            
+            now = asyncio.get_event_loop().time()
+            # Flush solo si el búfer es MUY grande, ha pasado mucho tiempo (10s), o es el hito final
+            is_final_milestone = any(kw in cleaned for kw in ["Successfully", "Commit completed"])
+            
+            # Subimos umbrales: 25 líneas o 10 segundos de espera
+            if is_final_milestone or len(log_buffer) > 25 or (now - last_report_time) > 10.0:
+                await flush_logs()
 
         try:
-            logger.debug(f"🔍 run_once: cmd={cmd}, cwd={service.cwd}, shell={service.shell}")
-
-            # Usamos subprocess.run para bloquear (dentro de thread) y capturar
-            # errors='ignore' para evitar problemas de encoding en Windows
-            proc = await asyncio.to_thread(
-                subprocess.run,
-                cmd,
+            # Iniciar proceso con pipes para stdout/stderr
+            proc = await asyncio.create_subprocess_exec(
+                *cmd_args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
                 cwd=service.cwd,
-                env=env,
-                capture_output=True,
-                text=True,
-                shell=service.shell,
-                timeout=timeout, # Timeout configurable (default: 60s)
-                errors='ignore' # Ignorar caracteres no decodificables
+                env=env
             )
 
-            logger.debug(f"✅ proc obtenido: returncode={proc.returncode}")
-            logger.info(f"📝 stdout length: {len(proc.stdout) if proc.stdout else 0}, stderr length: {len(proc.stderr) if proc.stderr else 0}")
-            if proc.stdout:
-                logger.debug(f"📝 stdout (first 500): {proc.stdout[:500]}")
-            if proc.stderr:
-                logger.debug(f"📝 stderr (first 500): {proc.stderr[:500]}")
+            stdout_chunks = []
+            stderr_chunks = []
+
+            async def read_stream(stream, collection, is_stderr=False):
+                while True:
+                    line = await stream.readline()
+                    if not line: break
+                    try:
+                        decoded = line.decode('utf-8', errors='ignore').strip()
+                        collection.append(decoded)
+                        if decoded:
+                            await send_log_event(decoded)
+                    except: pass
+
+            # Leer ambos streams en paralelo
+            await asyncio.gather(
+                read_stream(proc.stdout, stdout_chunks),
+                read_stream(proc.stderr, stderr_chunks, is_stderr=True)
+            )
+
+            # Flush final para no perder nada
+            await flush_logs()
+
+            # Esperar a que el proceso termine con el timeout
+            try:
+                exit_code = await asyncio.wait_for(proc.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.error(f"⏰ Timeout agotado ({timeout}s)")
+                try: proc.kill()
+                except: pass
+                return {"exit_code": -1, "status": "timeout", "error": f"Timeout ({timeout}s)"}
+
+            full_stdout = "\n".join(stdout_chunks)
+            full_stderr = "\n".join(stderr_chunks)
 
             return {
-                "exit_code": proc.returncode,
-                "stdout": proc.stdout[-10000:] if proc.stdout else "", # Últimos 10000 chars (antes 1000)
-                "stderr": proc.stderr[-10000:] if proc.stderr else "",
-                "status": "completed" if proc.returncode == 0 else "failed"
+                "exit_code": exit_code,
+                "stdout": full_stdout[-10000:],
+                "stderr": full_stderr[-10000:],
+                "status": "completed" if exit_code == 0 else "failed"
             }
-        except subprocess.TimeoutExpired as te:
-            logger.error(f"⏰ Timeout agotado en ejecución one-shot ({timeout}s)")
-            return {
-                "exit_code": -1,
-                "error": f"Timeout agotado ({timeout}s)",
-                "stdout": te.stdout[-5000:] if te.stdout else "", # Antes 500
-                "stderr": te.stderr[-5000:] if te.stderr else "",
-                "status": "timeout"
-            }
+
         except Exception as e:
-            logger.exception("Error en run_once")
+            logger.exception("Error en run_once asíncrono")
             return {"exit_code": -1, "error": str(e), "status": "error"}
 
     async def close(self, terminal_id: str) -> bool:
