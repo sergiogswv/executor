@@ -1070,7 +1070,7 @@ async def handle_command(cmd: ExecutorCommand, background_tasks: BackgroundTasks
                 import httpx
                 import uuid
                 from datetime import timezone
-                async with httpx.AsyncClient() as client:
+                async with httpx.AsyncClient(timeout=20.0) as client:
                     await client.post(f"{cerebro_url}/api/events", json={
                         "id": f"exec-{uuid.uuid4().hex[:8]}",
                         "source": "executor",
@@ -1081,7 +1081,7 @@ async def handle_command(cmd: ExecutorCommand, background_tasks: BackgroundTasks
                     })
                 logger.info(f"🚀 Resultado enviado a Cerebro por webhook ({event_type})")
             except Exception as e:
-                logger.error(f"❌ Error reportando a Cerebro: {e}")
+                logger.error(f"❌ Error reportando a Cerebro ({event_type}): {type(e).__name__}: {e}")
 
         # Encolar la tarea
         background_tasks.add_task(run_autofix_background)
