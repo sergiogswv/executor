@@ -176,6 +176,21 @@ class ProcessManager:
                 logger.info(f"🎯 Intentando forzar liberación del puerto {service.port}...")
                 subprocess.run(["fuser", "-k", f"{service.port}/tcp"], capture_output=True)
                 await asyncio.sleep(1.0) # Esperar a que el SO libere el puerto
+            elif platform.system() == "Windows":
+                logger.info(f"🎯 Buscando proceso que ocupa el puerto {service.port}...")
+                try:
+                    # Buscar el PID que usa el puerto
+                    output = subprocess.check_output(f'netstat -ano | findstr ":{service.port}.*LISTENING"', shell=True).decode()
+                    if output:
+                        # La salida suele ser: TCP 0.0.0.0:4001 0.0.0.0:0 LISTENING 1234
+                        parts = output.strip().split()
+                        pid = parts[-1]
+                        if pid and pid != "0":
+                            logger.info(f"💥 Matando proceso {pid} que ocupa el puerto {service.port}...")
+                            subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True)
+                            await asyncio.sleep(1.5) # Windows tarda un poco más
+                except Exception as e:
+                    logger.debug(f"No se pudo liberar el puerto {service.port}: {e}")
 
         terminal_id = f"{service_key}-{uuid.uuid4().hex[:8]}"
 
